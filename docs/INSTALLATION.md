@@ -14,6 +14,32 @@ The installer does not add `lcu` to your `PATH`. Invoke it by its installed path
 
 Where a command below is written as `lcu ...`, run it through the installed path for your platform. This is the `mcp` server harnesses launch; running it directly in an interactive terminal only prints a hint that it is a stdio MCP server.
 
+## Lazy startup and idle release (Pi, OMP and Codex)
+
+Run setup for the selected harness to capture its original instructions and tool schemas privately. For example:
+
+```sh
+lcu setup --agent pi --yes
+# or: lcu setup --agent codex --yes
+```
+
+Setup briefly starts and closes the original runtime; it does not call a computer-use tool. With a valid snapshot, ordinary agent sessions start no computer-use helpers until their first tool call. If metadata is missing or stale after an app or configuration change, LCU warns once and uses eager startup instead. Rerun setup with the intended Chrome/audio options and environment, then restart the harness to restore lazy startup. No official metadata is distributed with LCU.
+
+The runtime closes after ten idle minutes. For a different interval, set `LCU_IDLE_TIMEOUT_MS` in the adapter's environment:
+
+```sh
+LCU_IDLE_TIMEOUT_MS=900000 pi  # fifteen minutes; OMP inherits it the same way
+```
+
+Codex filters child environments. Set the variable on its existing LCU MCP registration instead of relying on the launching shell:
+
+```toml
+[mcp_servers.lcu.env]
+LCU_IDLE_TIMEOUT_MS = "900000"
+```
+
+Keep any other entries already in that table. Valid values are integer milliseconds from `1` to `2147483647`; zero does not disable expiry. Changing only this timeout needs no metadata refresh. Calls and approval waits are not idle. Idle release resets JavaScript bindings and handles; the next `js` reports the reset before executing code, and a following call can initialize afresh. Session shutdown still cleans up. See [adapter lifetime details and verification limits](ADAPTERS.md#lazy-pi-and-codex-lifetime).
+
 ## If you are the installing agent
 
 1. Check the OS, architecture, desktop account, and current harness. Adapters are `pi`, `codex`, `claude-code`, `omp` (Oh My Pi), and `hermes` (Hermes Agent); select the user's harness explicitly. OMP and Hermes are experimental; inspect their [verification limits](ADAPTERS.md) before claiming desktop behavior. If the harness has no adapter, report that gap and consult [the adapter contract](https://github.com/amontlabs/lcu/blob/main/docs/ADAPTERS.md). Do not substitute another harness.

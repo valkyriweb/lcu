@@ -6,7 +6,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import piExtension from '../pi/index.ts';
 
+import { metadataFixture } from './metadata-fixture.mjs';
 const fixture = fileURLToPath(new URL('./omp-mcp-fixture.mjs', import.meta.url));
+metadataFixture(fixture);
 
 test('OMP host surface preserves prompt sections and runs dynamically registered LCU tools', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'lcu-omp-'));

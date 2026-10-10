@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
 import piExtension from '../pi/index.ts';
 
+import { metadataFixture } from './metadata-fixture.mjs';
 const fixture = fileURLToPath(new URL('./mcp-fixture.mjs', import.meta.url));
+metadataFixture(fixture);
 const origin = 'http://127.0.0.1:8080';
 let session = 0;
 

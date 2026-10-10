@@ -423,7 +423,7 @@ test('Codex registration output that is not an object is a failure, and one harn
   let registrations = 0;
   override(t, setup.seams, 'run', (cmd, args) => {
     if (args[0] === r.skills) throw new TypeError('weird');
-    if (args.length === 6) return result(0);
+    if (args.length === 6 || args[0] === join(r.release, 'adapters/metadata.mjs')) return result(0);
     registrations += 1;
     if (registrations === 1) throw new Error('nope');
     return result(0, '{}');
@@ -445,13 +445,18 @@ test('Pi registration writes the local extension and the per-scope command, offl
   override(t, setup.seams, 'run', (cmd, args, options) => {
     calls.push([cmd, args, options]);
     if (args[0] === r.skills) return result(0, '[]');
+    if (args[0] === join(r.release, 'adapters/metadata.mjs')) {
+      assert.deepEqual(JSON.parse(args[1]), ['/usr/bin/lcu', '--audio']);
+      assert.equal(options.env.HOME, r.home);
+      return result(0);
+    }
     assert.deepEqual(args, ['install', join(r.home, '.local/share/lcu/pi/extension.mjs')]);
     assert.equal(options.env.PI_OFFLINE, '1');
     return result(0, 'Installed');
   });
   await output(t);
   assert.deepEqual(await setup.configure(['pi'], r.home, ['/usr/bin/lcu', '--audio'], r.tools, r.release, { environ: { HOME: r.home } }), []);
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3);
   const wrapper = readFileSync(join(r.home, '.local/share/lcu/pi/extension.mjs'), 'utf8');
   assert.ok(wrapper.includes(pathToFileURL(join(r.release, 'adapters/pi/index.ts')).href));
   assert.ok(wrapper.includes('realpathSync(process.cwd())'));

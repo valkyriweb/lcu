@@ -5,8 +5,12 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from '@e
 import type { TSchema } from 'typebox';
 import { createCuaClient, nativeAppApprovalOptions, nativeAppApprovalResponse } from '../client.mjs';
 import { persistAudioContent } from '../audio-files.mjs';
+import { readMetadata, assertMetadata } from '../metadata.mjs';
+import { createRuntimeLifetime } from '../runtime-lifetime.mjs';
 
 type OriginalContent = { type: string; text?: string; data?: string; mimeType?: string };
+type SessionClient = Pick<ReturnType<typeof createCuaClient>, 'instructions' | 'publicTools' | 'call' |
+  'turnEnded' | 'hasHostControl' | 'controlStatus' | 'controlStop' | 'close'>;
 
 function piContent(result: { content: OriginalContent[]; isError?: boolean }) {
   const content = result.content.map(item => {
@@ -69,8 +73,8 @@ export default function (pi: ExtensionAPI, options: {
   connectOnLoad?: boolean;
   ompEssentialTools?: boolean;
 } = {}) {
-  let bridge: ReturnType<typeof createCuaClient> | undefined;
-  let pending: Promise<ReturnType<typeof createCuaClient>> | undefined;
+  let bridge: SessionClient | undefined;
+  let pending: Promise<SessionClient> | undefined;
   let active: { sessionId: string; turnId: string } | undefined;
   let turnGeneration = 0;
   let pickerInFlight = false;
@@ -78,9 +82,12 @@ export default function (pi: ExtensionAPI, options: {
   // becomes active only after that cleanup succeeds, so no Sky action runs first.
   let awaitingTurn: { sessionId: string; turnId: string } | undefined;
   let pendingCleanup: { turn: { sessionId: string; turnId: string }; event: 'Stop' | 'Interrupt' } | undefined;
-  let pendingPickerCleanup: { client: ReturnType<typeof createCuaClient>; turn: { sessionId: string; turnId: string } } | undefined;
+  let pendingPickerCleanup: { client: SessionClient; turn: { sessionId: string; turnId: string } } | undefined;
   let cleanupInFlight: Promise<void> | undefined;
   let approvalContext: ExtensionContext | undefined;
+  let metadata: Awaited<ReturnType<typeof readMetadata>>;
+  let warnedMetadata = false;
+  const lifetime = createRuntimeLifetime(startClient);
 
   function warnCleanup(ctx: ExtensionContext, error: unknown) {
     const message = `LCU turn cleanup is pending: ${error instanceof Error ? error.message : String(error)}`;
@@ -88,7 +95,7 @@ export default function (pi: ExtensionAPI, options: {
     else console.error(message);
   }
 
-  async function cleanPickerTurn(client: ReturnType<typeof createCuaClient>, turn: { sessionId: string; turnId: string }) {
+  async function cleanPickerTurn(client: SessionClient, turn: { sessionId: string; turnId: string }) {
     try {
       await client.turnEnded({ ...turn, event: 'Stop' });
       if (pendingPickerCleanup?.turn.turnId === turn.turnId) pendingPickerCleanup = undefined;
@@ -114,7 +121,7 @@ export default function (pi: ExtensionAPI, options: {
       return;
     }
     const turn = { ...active };
-    const client = await connected();
+    const client = await sessionClient();
     if (!active || active.sessionId !== turn.sessionId || active.turnId !== turn.turnId) {
       ctx.ui.notify('The LCU turn ended before Stop could be sent.', 'warning');
       return;
@@ -175,7 +182,7 @@ export default function (pi: ExtensionAPI, options: {
     const turnId = randomUUID();
     const generation = turnGeneration;
     pickerInFlight = true;
-    let client: ReturnType<typeof createCuaClient> | undefined;
+    let client: SessionClient | undefined;
     let usedCommandTurn = false;
     let selectedTarget: { instruction: string; name: string } | undefined;
     const priorApprovalContext = approvalContext;
@@ -197,7 +204,7 @@ export default function (pi: ExtensionAPI, options: {
       return originalResultJson(result);
     };
     try {
-      client = await connected();
+      client = await sessionClient();
       assertIdle();
       const inventory = await callOriginal(`// lcu-pick:inventory
 {
@@ -379,7 +386,7 @@ export default function (pi: ExtensionAPI, options: {
     }
   }
 
-  function registerTools(client: ReturnType<typeof createCuaClient>) {
+  function registerTools(client: SessionClient) {
     // Pi refreshes tools registered during before_agent_start before its model call.
     for (const descriptor of client.publicTools()) {
       const name = descriptor.name;
@@ -390,7 +397,7 @@ export default function (pi: ExtensionAPI, options: {
         parameters: descriptor.inputSchema as TSchema,
         ...(options.ompEssentialTools ? { loadMode: 'essential' } : {}),
         async execute(id, args, signal, _onUpdate, ctx) {
-          const current = await connected();
+          const current = await sessionClient();
           if (pendingPickerCleanup) await retryPickerCleanup();
           if (!active && awaitingTurn) {
             const turn = awaitingTurn;
@@ -413,46 +420,85 @@ export default function (pi: ExtensionAPI, options: {
     }
   }
 
-  async function connected() {
+  async function sessionClient() {
     if (bridge) return bridge;
     if (!pending) {
       pending = (async () => {
-        const candidate = createCuaClient({
-          command: commandFromEnvironment(options.command),
-          cwd: process.cwd(),
-          adapter: options.ompEssentialTools ? 'omp' : 'pi',
-          allowedOrigins: originsFromEnvironment(),
-          onElicitation: async (params, { signal }) => {
-            const ctx = approvalContext;
-            if (!ctx?.hasUI) return { action: 'cancel' as const };
-            const nativeApproval = nativeAppApprovalOptions(params);
-            if (nativeApproval) {
-              if (typeof ctx.ui.select !== 'function') return { action: 'cancel' as const };
-              const selectedLabel = await ctx.ui.select(nativeApproval.message,
-                nativeApproval.choices.map(choice => choice.label), { signal });
-              const selectedValue = nativeApproval.choices.find(choice => choice.label === selectedLabel)?.value ?? 'cancel';
-              return nativeAppApprovalResponse(params, selectedValue);
+        try {
+          metadata = await readMetadata(commandFromEnvironment(options.command));
+        } catch (error) {
+          const message = `LCU is using eager startup: ${error instanceof Error ? error.message : String(error)}`;
+          if (!warnedMetadata) {
+            warnedMetadata = true;
+            if (typeof approvalContext?.ui?.notify === 'function') approvalContext.ui.notify(message, 'warning');
+            else console.error(message);
+          }
+          metadata = await lifetime.run(client => ({ instructions: client.instructions, tools: client.publicTools() }));
+        }
+        bridge = {
+          get instructions() { return metadata.instructions ?? ''; },
+          publicTools: () => metadata.tools.filter(tool => ['js', 'js_reset'].includes(tool.name)),
+          get hasHostControl() { return lifetime.current?.hasHostControl ?? false; },
+          async call(...args) {
+            if (lifetime.resetPending && args[0] !== 'js_reset') {
+              lifetime.acknowledgeReset();
+              throw new Error('LCU released the idle computer-use runtime. JavaScript bindings and handles were reset. ' +
+                'Repeat the original first-invocation entry point before continuing.');
             }
-            const schema = params?.requestedSchema;
-            if (params?.mode === 'url' || schema?.type !== 'object' ||
-                Object.keys(schema.properties ?? {}).length !== 0 ||
-                (schema.required?.length ?? 0) !== 0 || typeof params.message !== 'string') {
-              return { action: 'cancel' as const };
-            }
-            if (typeof ctx.ui.select !== 'function') return { action: 'cancel' as const };
-            const selected = await ctx.ui.select(params.message, ['Allow', 'Decline'], { signal });
-            if (selected === 'Allow') return { action: 'accept' as const, content: {} };
-            if (selected === 'Decline') return { action: 'decline' as const };
-            return { action: 'cancel' as const };
+            lifetime.acknowledgeReset();
+            return lifetime.run(client => client.call(...args));
           },
-        });
-        await candidate.connect();
-        bridge = candidate;
-        registerTools(candidate);
-        return candidate;
+          turnEnded: (...args) => lifetime.run(client => client.turnEnded(...args), { startIfMissing: false, activity: false }),
+          controlStatus: (...args) => lifetime.run(client => client.controlStatus(...args), { startIfMissing: false }),
+          controlStop: (...args) => lifetime.run(client => client.controlStop(...args), { startIfMissing: false }),
+          close: () => lifetime.close(),
+        };
+        registerTools(bridge);
+        return bridge;
       })().finally(() => { pending = undefined; });
     }
     return pending;
+  }
+
+  async function startClient() {
+    const candidate = createCuaClient({
+      command: commandFromEnvironment(options.command),
+      cwd: process.cwd(),
+      adapter: options.ompEssentialTools ? 'omp' : 'pi',
+      allowedOrigins: originsFromEnvironment(),
+      onElicitation: async (params, { signal }) => {
+        const ctx = approvalContext;
+        if (!ctx?.hasUI) return { action: 'cancel' as const };
+        const nativeApproval = nativeAppApprovalOptions(params);
+        if (nativeApproval) {
+          if (typeof ctx.ui.select !== 'function') return { action: 'cancel' as const };
+          const selectedLabel = await ctx.ui.select(nativeApproval.message,
+            nativeApproval.choices.map(choice => choice.label), { signal });
+          const selectedValue = nativeApproval.choices.find(choice => choice.label === selectedLabel)?.value ?? 'cancel';
+          return nativeAppApprovalResponse(params, selectedValue);
+        }
+        const schema = params?.requestedSchema;
+        if (params?.mode === 'url' || schema?.type !== 'object' ||
+            Object.keys(schema.properties ?? {}).length !== 0 ||
+            (schema.required?.length ?? 0) !== 0 || typeof params.message !== 'string') {
+          return { action: 'cancel' as const };
+        }
+        if (typeof ctx.ui.select !== 'function') return { action: 'cancel' as const };
+        const selected = await ctx.ui.select(params.message, ['Allow', 'Decline'], { signal });
+        if (selected === 'Allow') return { action: 'accept' as const, content: {} };
+        if (selected === 'Decline') return { action: 'decline' as const };
+        return { action: 'cancel' as const };
+      },
+    });
+    try {
+      await candidate.connect();
+      if (metadata) assertMetadata({ instructions: candidate.instructions, tools: candidate.publicTools() },
+        { instructions: metadata.instructions ?? '', tools: metadata.tools.filter(tool => ['js', 'js_reset'].includes(tool.name)) });
+      return candidate;
+    } catch (error) {
+      await candidate.close();
+      throw error;
+    }
   }
 
   async function finish(event: 'Stop' | 'Interrupt') {
@@ -487,7 +533,7 @@ export default function (pi: ExtensionAPI, options: {
       await finish('Interrupt');
       await retryPickerCleanup();
     } finally {
-      await bridge?.close();
+      await lifetime.close();
       bridge = undefined;
       approvalContext = undefined;
     }
@@ -495,7 +541,7 @@ export default function (pi: ExtensionAPI, options: {
 
   pi.on('before_agent_start', async (event, ctx) => {
     approvalContext = ctx;
-    const client = await connected();
+    const client = await sessionClient();
     // Returning systemPrompt makes Pi force that prompt, collapsing its
     // structured prompt and tool-addition deltas into one head (breaking prompt
     // caching after tool_search). Pi hands us its mutable systemPromptOptions,
@@ -568,8 +614,8 @@ export default function (pi: ExtensionAPI, options: {
     },
   });
 
-  // OMP builds the initial provider tool list after extension loading. Connect
-  // during factory execution so LCU tools are registered before that snapshot.
-  if (options.connectOnLoad) return connected().then(() => undefined);
+  // OMP builds its first tool list after extension loading. Load only setup metadata here;
+  // neither OMP nor Pi starts the runtime until a computer-use call.
+  if (options.connectOnLoad) return sessionClient().then(() => undefined);
 
 }

@@ -12,6 +12,7 @@ import {
   ToolListChangedNotificationSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 
+import { captureMetadata } from '../metadata.mjs';
 const relay = fileURLToPath(new URL('../codex.mjs', import.meta.url));
 const fixture = fileURLToPath(new URL('./codex-fixture.mjs', import.meta.url));
 const AUDIO_BYTES = Buffer.from([0, 17, 34, 51, 68, 85, 102, 119, 128, 255]);
@@ -67,6 +68,8 @@ async function connectCodexRelay(relayPath = relay, { delayProgress = false } = 
     const preload = new URL('./codex-progress-delay.mjs', import.meta.url).href;
     env.NODE_OPTIONS = `--import=${preload}`;
   }
+  await captureMetadata([process.execPath, fixture], { env });
+  rmSync(logPath, { force: true });
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [relayPath, process.execPath, fixture],
@@ -167,6 +170,9 @@ test('Codex relay starts through the installed current symlink', { timeout: 10_0
   const adapters = join(release, 'adapters');
   mkdirSync(adapters, { recursive: true });
   copyFileSync(relay, join(adapters, 'codex.mjs'));
+  for (const name of ['metadata.mjs', 'runtime-lifetime.mjs']) {
+    copyFileSync(fileURLToPath(new URL(`../${name}`, import.meta.url)), join(adapters, name));
+  }
   copyFileSync(fileURLToPath(new URL('../audio-files.mjs', import.meta.url)), join(adapters, 'audio-files.mjs'));
   copyFileSync(fileURLToPath(new URL('../client.mjs', import.meta.url)), join(adapters, 'client.mjs'));
   copyFileSync(fileURLToPath(new URL('../host-guard.mjs', import.meta.url)), join(adapters, 'host-guard.mjs'));

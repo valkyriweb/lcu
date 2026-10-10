@@ -29,6 +29,10 @@ python3 "$test_dir/integration.py" "${command[@]}"
 # The same fixture through each adapter path (Codex and Claude relays, Pi/OMP client, Hermes bridge)
 # without any sandbox metadata. LCU_REQUIRE_SANDBOX=1 also checks the original sandbox is in effect.
 python3 "$test_dir/adapter_paths.py" "${command[@]}"
+# Cached contracts and idle/shutdown teardown against the original runtime, without a model provider.
+adapter_root=${LCU_ADAPTER_ROOT:-/opt/lcu/current}
+adapter_node=$(<"$adapter_root/node-path")
+"$adapter_node" "$test_dir/adapter_lifetime.mjs" "${command[@]}"
 # GTK 4 reads only XInput2: see the notes in the test about window-targeted versus desktop-level input.
 python3 "$test_dir/gtk4_input.py" "${command[@]}"
 python3 "$test_dir/linux_input_controls.py" "${command[@]}"

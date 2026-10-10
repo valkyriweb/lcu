@@ -1,12 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import piExtension from '../pi/index.ts';
 
+import { metadataFixture } from './metadata-fixture.mjs';
 const fixture = fileURLToPath(new URL('./mcp-fixture.mjs', import.meta.url));
+metadataFixture(fixture);
 
 async function waitForFileMatch(path, predicate, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
@@ -470,6 +472,7 @@ test('Pi retains failed turn cleanup, warns without throwing, and keeps Sky tool
     piExtension(pi);
     await handlers.get('before_agent_start')({ systemPrompt: 'Pi' }, ctx);
     await handlers.get('agent_start')({}, ctx);
+    await tools.get('js_reset').execute('start', {}, undefined, undefined, ctx);
     await handlers.get('agent_end')({ messages: [{ role: 'assistant', stopReason: 'stop' }] }, ctx);
     assert.equal(warnings.length, 1);
     assert.equal(warnings[0].level, 'warning');
@@ -522,6 +525,7 @@ test('Pi can recover when a retained cleanup succeeds on retry', async () => {
     piExtension(pi);
     await handlers.get('before_agent_start')({ systemPrompt: 'Pi' }, ctx);
     await handlers.get('agent_start')({}, ctx);
+    await tools.get('js_reset').execute('start', {}, undefined, undefined, ctx);
     await handlers.get('agent_end')({ messages: [{ role: 'assistant', stopReason: 'stop' }] }, ctx);
     assert.equal(warnings.length, 1);
     assert.match(warnings[0].message, /cleanup failed once/);
@@ -633,6 +637,7 @@ test('Pi drops a held turn that ends while cleanup is pending and never runs its
     piExtension(pi);
     await handlers.get('before_agent_start')({ systemPrompt: 'Pi' }, ctx);
     await handlers.get('agent_start')({}, ctx);
+    await tools.get('js_reset').execute('start', {}, undefined, undefined, ctx);
     await handlers.get('agent_end')({ messages: [{ role: 'assistant', stopReason: 'stop' }] }, ctx);
     await handlers.get('agent_start')({}, ctx);
     assert.equal(warnings.length, 2);
@@ -662,12 +667,14 @@ test('Pi deduplicates agent_end cleanup when shutdown overlaps it', async () => 
   process.env.LCU_MCP_COMMAND = JSON.stringify([process.execPath, fixture]);
   process.env.LCU_FIXTURE_LOG = log;
   const handlers = new Map();
-  const pi = { on(event, handler) { handlers.set(event, handler); }, registerTool() {}, registerCommand() {} };
+  const tools = new Map();
+  const pi = { on(event, handler) { handlers.set(event, handler); }, registerTool(tool) { tools.set(tool.name, tool); }, registerCommand() {} };
   const ctx = { sessionManager: { getSessionId: () => 'overlap-session' }, hasUI: false };
   try {
     piExtension(pi);
     await handlers.get('before_agent_start')({ systemPrompt: 'Pi' }, ctx);
     await handlers.get('agent_start')({}, ctx);
+    await tools.get('js_reset').execute('start', {}, undefined, undefined, ctx);
     const ending = handlers.get('agent_end')({
       messages: [{ role: 'assistant', stopReason: 'stop' }],
     }, ctx);
@@ -706,7 +713,8 @@ test('Pi does not start another host to end a turn when the host never connected
     await handlers.get('agent_start')({}, ctx);
     await handlers.get('agent_end')({ messages: [{ role: 'assistant', stopReason: 'stop' }] }, ctx);
     await handlers.get('session_shutdown')();
-    assert.deepEqual(warnings, []);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0].message, /eager startup.*setup/s);
     assert.equal(readFileSync(spawns, 'utf8'), 'x');
   } finally {
     if (oldCommand === undefined) delete process.env.LCU_MCP_COMMAND;

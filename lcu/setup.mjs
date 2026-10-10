@@ -523,11 +523,21 @@ export async function configure(names, home, command, toolsRoot, releaseRoot,
     }
   };
 
+  let metadataCaptured = false;
+  const prepareMetadata = () => {
+    if (metadataCaptured) return;
+    checked('installer', node, [join(releaseRoot, 'adapters/metadata.mjs'), JSON.stringify(command)],
+      { cwd, env, timeout: 300_000 });
+    metadataCaptured = true;
+  };
   for (const name of names) {
     const client = CLIENTS[name];
     if (name === 'omp' || name === 'hermes') {
       try {
-        if (name === 'omp') configureOmp(home, command, releaseRoot, { scope, project, env });
+        if (name === 'omp') {
+          configureOmp(home, command, releaseRoot, { scope, project, env });
+          prepareMetadata();
+        }
         else configureHermes(home, command, node, releaseRoot, { scope, project, env });
         say(`${client.label}: plugin registered.`);
       } catch (error) {
@@ -573,9 +583,10 @@ export async function configure(names, home, command, toolsRoot, releaseRoot,
     try {
       let result;
       if (name === 'pi') {
-        result = registerPi(home, command, releaseRoot, { scope, project, env, cwd, setupCommand });
+        result = registerPi(home, command, releaseRoot, { scope, project, env, cwd, setupCommand, prepareMetadata });
       } else {
         if (mcpSetupError) throw new Error(mcpSetupError);
+        if (name === 'codex') prepareMetadata();
         preflightMcp(node, mcp, client, scope, cwd, env);
         const policy = approvals.mergeCodexPolicy(await hostPolicy(releaseRoot), codexPlan?.policy ?? {});
         result = checked('installer', node, ['--input-type=module', '-e', MCP_REGISTER, mcp, client.mcpAgent, scope,
@@ -608,7 +619,7 @@ export async function configure(names, home, command, toolsRoot, releaseRoot,
 }
 
 /** Pi loads LCU as a local extension that selects the registered command per project. */
-function registerPi(home, command, releaseRoot, { scope, project, env, cwd, setupCommand }) {
+function registerPi(home, command, releaseRoot, { scope, project, env, cwd, setupCommand, prepareMetadata }) {
   const pi = seams.which('pi', env.PATH);
   if (!pi) {
     throw new Error('Pi is not on the target account PATH. Install Pi, then run ' +
@@ -616,6 +627,7 @@ function registerPi(home, command, releaseRoot, { scope, project, env, cwd, setu
   }
   const adapter = join(releaseRoot, 'adapters/pi/index.ts');
   if (!existsSync(adapter)) throw new Error(`LCU Pi adapter missing: ${adapter}`);
+  prepareMetadata();
   const root = windows() ? join(home, 'AppData/Local/LCU/pi') : join(home, '.local/share/lcu/pi');
   const extension = join(root, 'extension.mjs');
   const selectedCommand = join(root, 'commands.json');

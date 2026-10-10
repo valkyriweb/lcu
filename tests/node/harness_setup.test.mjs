@@ -50,7 +50,7 @@ test('OMP links a per-profile package that imports the adapter relatively, with 
   const f = fixture(t);
   for (const profile of ['blue', 'green']) {
     assert.deepEqual(await f.configure('omp', { env: { OMP_PROFILE: profile } }), []);
-    const { argv, options } = f.calls.at(-1);
+    const { argv, options } = f.calls.findLast(call => call.argv[0] === '/bin/omp');
     assert.deepEqual(argv.slice(0, 3), ['/bin/omp', 'plugin', 'link']);
     const pkg = argv[3];
     assert.deepEqual(JSON.parse(readFileSync(join(pkg, 'package.json'), 'utf8')).omp.extensions, ['./index.ts']);
@@ -63,7 +63,8 @@ test('OMP links a per-profile package that imports the adapter relatively, with 
     assert.equal(options.cwd, f.home);
     assert.equal(options.env.HOME, f.home);
   }
-  assert.notEqual(f.calls[0].argv.at(-1), f.calls[1].argv.at(-1));
+  const links = f.calls.filter(call => call.argv[0] === '/bin/omp');
+  assert.notEqual(links[0].argv.at(-1), links[1].argv.at(-1));
   assert.equal(existsSync(join(f.project, '.pi')), false);
 });
 
