@@ -64,6 +64,14 @@ test('a holder that is killed releases the lock', async (t) => {
   assert.equal(existsSync(path), !WINDOWS, WINDOWS_LOCK);
 });
 
+test('a failed protected operation releases its lock for the next operation', async (t) => {
+  const path = join(temporary(t), 'setup.lock');
+  const failure = new Error('operation failed');
+  await assert.rejects(withLock(path, async () => { throw failure; }), (error) => error === failure);
+  assert.equal(await withLock(path, async () => 'next operation', { wait: 0 }), 'next operation');
+  assert.equal(existsSync(path), !WINDOWS, WINDOWS_LOCK);
+});
+
 test('a bounded wait says once that it is waiting, then gives up with the caller\'s error', async (t) => {
   const path = join(temporary(t), 'origins.lock');
   const child = await holder(t, path);
