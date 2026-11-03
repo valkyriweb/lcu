@@ -139,3 +139,27 @@ test('awaitChoice waits for a claimed record\'s choice, and gives up when the re
   assert.equal(await aborted, undefined);
   assert.equal(broker.size, 0);
 });
+
+test('release ends the waits of the approvals one tool call opened, and only those', async () => {
+  const broker = createApprovalBroker();
+  const message = 'Allow Computer Use to use "Zed"?';
+  const first = broker.open(params(), { call: 1 });
+  broker.describe(message, MOD);
+  const second = broker.open(params(), { call: 2 });
+  broker.describe(message, MOD);
+  let secondDone = false;
+  const firstWait = broker.awaitChoice(first);
+  const secondWait = broker.awaitChoice(second).then(value => { secondDone = true; return value; });
+  broker.release(1);
+  assert.equal(await firstWait, undefined, 'the ended call\'s approval is cancelled');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(secondDone, false, 'another call\'s approval keeps waiting');
+  broker.choose(second, 'session', MOD);
+  assert.equal(await secondWait, 'session');
+
+  // Released before the host's answer arrived: the wait that follows ends at once.
+  const third = broker.open(params(), { call: 3 });
+  broker.describe(message, MOD);
+  broker.release(3);
+  assert.equal(await broker.awaitChoice(third), undefined);
+});

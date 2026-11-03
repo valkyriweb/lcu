@@ -14,7 +14,8 @@ import { installHooks, requireCliHookSupport, exportFiles } from './codex_hooks.
 import { install as installApprovalMod } from './claude_mod.mjs';
 import { install as hideHostOnlyTools } from './claude_visibility.mjs';
 import { accountHome, isFile, lstat, real, shellQuote } from './fsutil.mjs';
-import { configureHermes, configureOmp } from './harness_setup.mjs';
+import { approvalNote, question as crossTurnQuestion, readCrossTurn, setCrossTurn } from './cross_turn.mjs';
+import { configureDsh, configureHermes, configureJunie, configureOmp, DSH_DEFAULT_PROFILE, dshExecutable, validDshProfile } from './harness_setup.mjs';
 import { withLock } from './lock.mjs';
 import { ask, say, warn } from './terminal.mjs';
 
@@ -38,13 +39,16 @@ export const CLIENTS = {
   pi: { label: 'Pi', executable: 'pi', detectPath: '.pi/agent', mcpAgent: 'pi' },
   omp: { label: 'Oh My Pi', executable: 'omp', detectPath: '.omp', mcpAgent: '' },
   hermes: { label: 'Hermes', executable: 'hermes', detectPath: '.hermes', mcpAgent: '' },
+  dsh: { label: 'DeepSeek Harness', executable: 'dsh', detectPath: '.dsh', mcpAgent: '' },
+  junie: { label: 'Junie', executable: 'junie', detectPath: '.junie', mcpAgent: '' },
 };
-export const ALIASES = { claude: 'claude-code', 'oh-my-pi': 'omp', 'hermes-agent': 'hermes' };
+export const ALIASES = { claude: 'claude-code', 'oh-my-pi': 'omp', 'hermes-agent': 'hermes', 'deepseek-harness': 'dsh' };
 // Harnesses whose native registration needs their own executable; Codex and Claude Code register through
-// add-mcp and their config files without the CLI installed.
-const NEEDS_BINARY = ['pi', 'omp', 'hermes'];
-// Native harness plugins are profile-scoped; project scope is unsupported.
-const USER_ONLY_AGENTS = ['omp', 'hermes'];
+// add-mcp and their config files, and Junie through its config files, without the CLI installed.
+const NEEDS_BINARY = ['pi', 'omp', 'hermes', 'dsh'];
+// Native harness plugins are profile-scoped, and Junie reads hooks only from the user's config; project scope is
+// unsupported.
+const USER_ONLY_AGENTS = ['omp', 'hermes', 'dsh', 'junie'];
 
 // Shell and Windows command-line quoting for the commands LCU prints and registers.
 export const shellJoin = (args) => args.map(shellQuote).join(' ');
@@ -108,6 +112,9 @@ export const seams = {
   /** Run a child on this terminal: `{status, signal, error}`. */
   spawn: (command, args, options) => spawnSync(...capture.batchCommand(command, args, { stdio: 'inherit', ...options })),
   which,
+  /** Installed DeepSeek Harness app bundles, whose `dsh` CLI setup uses when none is on PATH. */
+  dshApps: (home) => (process.platform === 'darwin'
+    ? ['/Applications', join(home, 'Applications')].map((root) => join(root, 'DeepSeek Harness.app')) : []),
   account: lookupAccount,
   interactive: () => process.stdin.isTTY === true,
   ask,
@@ -224,7 +231,7 @@ export function applyChanges(changes) {
 
 // Saved choices ----------------------------------------------------------------------------------------
 
-const stateDirectory = (home) => (windows() ? join(home, 'AppData/Local/LCU') : join(home, '.local/state/lcu'));
+export const stateDirectory = (home) => (windows() ? join(home, 'AppData/Local/LCU') : join(home, '.local/state/lcu'));
 
 /** Run `fn` holding the account's setup lock. */
 export function setupLock(home, fn) {
@@ -254,7 +261,8 @@ export function loadSetupState(home) {
   const context = parsed.pending_context ?? null;
   const validContext = context === null || (typeof context === 'object' && !Array.isArray(context) &&
     ['user', 'project'].includes(context.scope) && ['discover', 'direct'].includes(context.session) &&
-    (context.project === null || context.project === undefined || typeof context.project === 'string'));
+    (context.project === null || context.project === undefined || typeof context.project === 'string') &&
+    (context.dsh_profile === undefined || validDshProfile(context.dsh_profile)));
   if (typeof parsed.chrome !== 'boolean' || typeof parsed.audio !== 'boolean' || !['ask', 'auto'].includes(parsed.approval ?? 'ask') ||
       !Array.isArray(pending) || !pending.every((item) => NEEDS_BINARY.includes(item)) || !validContext) throw malformed();
   return { chrome: parsed.chrome, audio: parsed.audio, approval: parsed.approval ?? 'ask', pending: [...new Set(pending)],
@@ -275,7 +283,8 @@ function harnessSearchPath(home, path = process.env.PATH ?? '') {
   return [...new Set([...path.split(delimiter).filter(Boolean), ...extra])].join(delimiter);
 }
 
-export const harnessInstalled = (name, home, path) => Boolean(seams.which(CLIENTS[name].executable, harnessSearchPath(home, path)));
+export const harnessInstalled = (name, home, path) => Boolean(name === 'dsh' ? dshExecutable(home, harnessSearchPath(home, path))
+  : seams.which(CLIENTS[name].executable, harnessSearchPath(home, path)));
 
 // Installers ---------------------------------------------------------------------------------------------
 
@@ -293,6 +302,7 @@ export function installerEnvironment(home, names, environ = process.env) {
   if (names.includes('codex')) supported.push('CODEX_HOME');
   if (names.includes('hermes')) supported.push('HERMES_HOME');
   if (names.includes('omp')) supported.push('PI_CODING_AGENT_DIR');
+  if (names.includes('dsh')) supported.push('DSH_HOME');
   if (['opencode', 'vscode', 'copilot-cli'].some((name) => names.includes(name))) supported.push('XDG_CONFIG_HOME');
   for (const variable of supported) {
     if (env[variable] && !isAbsolute(env[variable])) throw new Error(`${variable} must be absolute.`);
@@ -501,7 +511,7 @@ const describe = (error) => ([TypeError, ReferenceError, RangeError, SyntaxError
  * harness approval settings alone), `auto` or `ask` (see approval.mjs).
  */
 export async function configure(names, home, command, toolsRoot, releaseRoot,
-  { scope = 'user', project = null, setupCommand = null, environ, approval = null } = {}) {
+  { scope = 'user', project = null, setupCommand = null, environ, approval = null, dshProfile = DSH_DEFAULT_PROFILE } = {}) {
   const env = installerEnvironment(home, names, environ);
   const [node, skills, mcp] = await installerPaths(toolsRoot);
   const resources = await installedAppResources(releaseRoot);
@@ -525,13 +535,26 @@ export async function configure(names, home, command, toolsRoot, releaseRoot,
 
   for (const name of names) {
     const client = CLIENTS[name];
-    if (name === 'omp' || name === 'hermes') {
+    if (name === 'omp' || name === 'hermes' || name === 'dsh') {
       try {
         if (name === 'omp') configureOmp(home, command, releaseRoot, { scope, project, env });
-        else configureHermes(home, command, node, releaseRoot, { scope, project, env });
-        say(`${client.label}: plugin registered.`);
+        else if (name === 'hermes') configureHermes(home, command, node, releaseRoot, { scope, project, env });
+        else configureDsh(home, command, releaseRoot, { scope, env, profile: dshProfile });
+        say(name === 'dsh' ? `${client.label}: plugin registered in profile ${dshProfile} ` +
+          `(remove it with \`dsh plugin --profile ${dshProfile} remove lcu-computer-use\`).` : `${client.label}: plugin registered.`);
       } catch (error) {
         fail(name, 'plugin', error);
+        continue;
+      }
+      applyApproval(name);
+      continue;
+    }
+    if (name === 'junie') {
+      try {
+        const { mcpPath, configPath } = configureJunie(home, command, node, releaseRoot, { scope });
+        say(`${client.label}: MCP server registered in ${mcpPath}; turn hooks in ${configPath}.`);
+      } catch (error) {
+        fail(name, 'MCP', error);
         continue;
       }
       applyApproval(name);
@@ -595,14 +618,24 @@ export async function configure(names, home, command, toolsRoot, releaseRoot,
         const cli = locateCodexTools(resources, { windows: windows() }).cli;
         await installHooks(cli, registered.path, cwd, env, originalPlugins, setupCommand);
       } else if (name === 'claude-code') {
-        hideHostOnlyTools(home, { project: projectScope });
-        say(`${client.label}: approval mod installed at ${installApprovalMod(home, releaseRoot, { project: projectScope })}.`);
+        const recordedNode = join(releaseRoot, 'node-path');
+        hideHostOnlyTools(home, { project: projectScope, root: releaseRoot,
+          node: existsSync(recordedNode) ? readFileSync(recordedNode, 'utf8').trim() : node });
       }
       say(`${client.label}: ${phase} registered.`);
-      applyApproval(name, codexPlan);
     } catch (error) {
       fail(name, phase, error);
+      continue;
     }
+    // Its own phase: the MCP server is registered by now, and the approval mode applies without the mod.
+    if (name === 'claude-code') {
+      try {
+        say(`${client.label}: approval mod installed at ${installApprovalMod(home, releaseRoot, { project: projectScope })}.`);
+      } catch (error) {
+        fail(name, 'approval mod', error);
+      }
+    }
+    applyApproval(name, codexPlan);
   }
   return failures;
 }
@@ -619,7 +652,10 @@ function registerPi(home, command, releaseRoot, { scope, project, env, cwd, setu
   const root = windows() ? join(home, 'AppData/Local/LCU/pi') : join(home, '.local/share/lcu/pi');
   const extension = join(root, 'extension.mjs');
   const selectedCommand = join(root, 'commands.json');
-  const wrapper = `import lcu from ${JSON.stringify(pathToFileURL(adapter).href)};\n` +
+  // Pi-Bolt's compiler does not follow a file:// import and leaves the adapter interpreted (Pi-Bolt 1.0.5).
+  // Windows keeps the URL form: its path is no import specifier without one.
+  const specifier = windows() ? pathToFileURL(adapter).href : adapter;
+  const wrapper = `import lcu from ${JSON.stringify(specifier)};\n` +
     'import {readFileSync, realpathSync} from "node:fs";\n' +
     `const config = JSON.parse(readFileSync(${JSON.stringify(selectedCommand)}, "utf8"));\n` +
     'export default pi => lcu(pi, {command: config.projects?.[realpathSync(process.cwd())] ?? config.user});\n';
@@ -703,6 +739,7 @@ export const OPTIONS = {
   project: { type: 'string' },
   yes: { type: 'boolean', default: false },
   'list-agents': { type: 'boolean', default: false },
+  'dsh-profile': { type: 'string' },
   export: { type: 'string' },
   chrome: { type: 'boolean', default: false },
   'no-chrome': { type: 'boolean', default: false },
@@ -712,16 +749,19 @@ export const OPTIONS = {
   session: { type: 'string' },
   'allow-missing': { type: 'boolean', default: false },
   reconcile: { type: 'boolean', default: false },
+  'cross-turn': { type: 'string' },
+  unattended: { type: 'boolean', default: false },
   'browser-host': { type: 'boolean', default: false },
   'check-desktop': { type: 'boolean', default: false },
   'validate-only': { type: 'boolean', default: false },
   help: { type: 'boolean', short: 'h', default: false },
 };
-const CHOICES = { scope: ['user', 'project'], approval: ['ask', 'auto'], session: ['discover', 'direct'] };
+const CHOICES = { scope: ['user', 'project'], approval: ['ask', 'auto'], session: ['discover', 'direct'], 'cross-turn': ['on', 'off'] };
 
 export const USAGE = 'Usage: lcu setup [--agent ID ...] [--scope user|project] [--project PATH] [--yes] [--chrome | --no-chrome]\n' +
   '                 [--audio | --no-audio] [--approval ask|auto] [--session discover|direct] [--allow-missing]\n' +
-  '                 [--reconcile] [--check-desktop] [--export PATH] [--list-agents] [--user ACCOUNT] [--prefix PATH]';
+  '                 [--cross-turn on|off [--unattended]] [--reconcile] [--check-desktop] [--export PATH] [--list-agents] [--user ACCOUNT] [--prefix PATH]\n' +
+  '                 [--dsh-profile NAME]';
 const HELP = `${USAGE}
 
 Configure LCU tools, without requiring a running desktop.
@@ -743,7 +783,13 @@ Options:
                       entries and leaves harness defaults (the default, kept from the previous setup)
   --session discover|direct
                       discover attaches through lcu-session (XFCE); direct uses the current desktop account
-  --allow-missing     Skip pi, omp and hermes when their executable is not installed yet and record them as
+  --cross-turn on|off Keep Computer Use available across turns, including turns started by background events
+                      (macOS and Windows per-app approvals still apply). on asks the owner to authenticate on macOS. Without it,
+                      interactive setup asks once; --yes leaves the setting unchanged. Same as \`lcu cross-turn\`
+  --unattended        With --cross-turn on: skip the owner prompt; for disposable sandbox machines only
+  --dsh-profile NAME  DeepSeek Harness profile to install the LCU plugin into (default: desktop, the app's; quit the
+                      app first)
+  --allow-missing     Skip pi, omp, hermes and dsh when their executable is not installed yet and record them as
                       pending (Codex and Claude Code still register); exit 0 when that is the only problem.
                       \`lcu setup --reconcile\` registers them once they appear
   --reconcile         Register pending harnesses that are now installed, using the saved opt-ins and approval
@@ -785,11 +831,14 @@ export function validate(args) {
   if (args.reconcile) {
     const used = [['--agent', args.agent.length], ['--export', args.export], ['--approval', args.approval], ['--chrome', args.chrome],
       ['--no-chrome', args['no-chrome']], ['--audio', args.audio], ['--no-audio', args['no-audio']], ['--project', args.project],
-      ['--check-desktop', args['check-desktop']], ['--allow-missing', args['allow-missing']], ['--scope', args.scope !== 'user']]
+      ['--check-desktop', args['check-desktop']], ['--allow-missing', args['allow-missing']], ['--cross-turn', args['cross-turn']], ['--unattended', args.unattended], ['--scope', args.scope !== 'user'],
+      ['--dsh-profile', args['dsh-profile']]]
       .filter(([, value]) => value).map(([flag]) => flag);
     if (used.length) throw new Error(`--reconcile uses the saved setup and cannot be combined with ${used.join(', ')}.`);
   }
   if (args['allow-missing'] && args.export) throw new Error('--allow-missing configures a harness; it cannot be combined with --export.');
+  if (args.unattended && args['cross-turn'] !== 'on') throw new Error('--unattended only applies together with --cross-turn on.');
+  if (args['cross-turn'] && args.export) throw new Error('--cross-turn configures this account; it cannot be combined with --export.');
   if (args.chrome && args['no-chrome']) throw new Error('Use either --chrome or --no-chrome, not both.');
   if (args.audio && args['no-audio']) throw new Error('Use either --audio or --no-audio, not both.');
   const prefix = args.prefix;
@@ -834,6 +883,10 @@ export function validate(args) {
   }
   if (names.length === 1 && names[0] === 'all') names = Object.keys(CLIENTS);
   if (!(names.length === 1 && names[0] === 'auto')) validateAgentScope(names, args.scope);
+  if (args['dsh-profile'] !== undefined) {
+    if (args.export) throw new Error('--dsh-profile configures DeepSeek Harness; it cannot be combined with --export.');
+    if (!validDshProfile(args['dsh-profile'])) throw new Error(`Invalid --dsh-profile name: ${args['dsh-profile']}`);
+  }
   return { account, names };
 }
 
@@ -841,12 +894,13 @@ const agentScopes = (name) => (USER_ONLY_AGENTS.includes(name) ? 'user' : 'user,
 
 function validateAgentScope(names, scope) {
   if (scope === 'project' && names.some((name) => USER_ONLY_AGENTS.includes(name))) {
-    throw new Error('Oh My Pi and Hermes native plugins are profile-scoped. Use --scope user with the intended profile; project scope is not supported.');
+    throw new Error('Oh My Pi, Hermes and DeepSeek Harness native plugins are profile-scoped, and Junie reads hooks only from ~/.junie/config.json. Use --scope user with the intended profile; project scope is not supported.');
   }
 }
 
 export const detect = (home) => Object.entries(CLIENTS)
-  .filter(([, client]) => seams.which(client.executable) || existsSync(join(home, client.detectPath))).map(([name]) => name);
+  .filter(([name, client]) => (name === 'dsh' ? dshExecutable(home) : seams.which(client.executable)) ||
+    existsSync(join(home, client.detectPath))).map(([name]) => name);
 
 async function chooseAgents(home) {
   const detected = detect(home);
@@ -959,7 +1013,7 @@ async function reconcile(args, account, home, register) {
     say(`LCU: registering ${names.map((name) => CLIENTS[name].label).join(', ')} (installed since setup) with the saved settings.`);
     const failures = await register(names, home, [...desktopCommand, ...runtimeFlags(state.chrome, state.audio)], toolsRoot,
       releaseRoot, { scope: context.scope, project, setupCommand: runtime, environ: environment,
-        approval: state.approval === 'auto' ? 'auto' : null });
+        approval: state.approval === 'auto' ? 'auto' : null, dshProfile: context.dsh_profile ?? DSH_DEFAULT_PROFILE });
     const failed = new Set(failures.map(([name]) => name));
     const remaining = state.pending.filter((name) => !names.includes(name) || failed.has(name));
     saveSetupState(home, { chrome: state.chrome, audio: state.audio, approval: state.approval, pending: remaining, pendingContext: context });
@@ -984,7 +1038,7 @@ function becomeAccount(account) {
 }
 
 /** `lcu setup ARGV`; `configure` registers the selected harnesses (another one only in tests). Returns the exit status. */
-export async function main(argv, { configure: register = configure } = {}) {
+export async function main(argv, { configure: register = configure, crossTurn = {} } = {}) {
   let args;
   try {
     args = parse(argv);
@@ -1020,14 +1074,14 @@ export async function main(argv, { configure: register = configure } = {}) {
         return 1;
       }
     }
-    return await setup(args, account, home, names, register);
+    return await setup(args, account, home, names, register, crossTurn);
   } catch (error) {
     warn(`Setup failed: ${describe(error)}`);
     return 1;
   }
 }
 
-async function setup(args, account, home, names, register) {
+async function setup(args, account, home, names, register, crossTurn) {
   const { releaseRoot, runtime, launcher, desktopCommand, directRuntime } = runtimePaths(args, account);
   requireLaunchers(runtime, launcher);
   if (names.length === 1 && names[0] === 'auto') {
@@ -1059,13 +1113,19 @@ async function setup(args, account, home, names, register) {
   }
   const setupCommand = runtime;
   const outcome = await setupLock(home, () => registerLocked(args, account, home, names, missing, register,
-    { releaseRoot, desktopCommand, directRuntime, toolsRoot, setupCommand, setupEnvironment }));
+    { releaseRoot, desktopCommand, directRuntime, toolsRoot, setupCommand, setupEnvironment, crossTurn }));
   if (outcome === 'cancelled') return 0;
   return finish(args, outcome, { desktopCommand, directRuntime, setupCommand, home });
 }
 
+/** Printed by setup for Junie, never to a model: its MCP client cannot show LCU's per-app approval prompt. */
+export const JUNIE_APPROVAL_WARNING = 'Warning: Junie can\'t show LCU\'s per-app approval prompt. Junie will run `lcu apps allow <App>` ' +
+  'itself when it needs an app; each approval (Touch ID or password) allows that app until you revoke it with ' +
+  '`lcu apps revoke <App>`. List allowed apps with `lcu apps`.';
+export const JUNIE_CONTINUE_QUESTION = 'Continue? [y/N] ';
+
 async function registerLocked(args, account, home, names, missing, register, paths) {
-  const { releaseRoot, desktopCommand, directRuntime, toolsRoot, setupCommand, setupEnvironment } = paths;
+  const { releaseRoot, desktopCommand, directRuntime, toolsRoot, setupCommand, setupEnvironment, crossTurn } = paths;
   const state = loadSetupState(home);
   // A saved choice, including a declined prompt, suppresses the prompt.
   const saved = existsSync(setupStatePath(home));
@@ -1093,6 +1153,14 @@ async function registerLocked(args, account, home, names, missing, register, pat
     approvalMode = 'auto';
     say('Keeping automatic approval of LCU tools from the previous setup (use --approval ask to restore harness defaults).');
   }
+  // Cross-turn Computer Use has its own file. An explicit flag wins; otherwise the owner is asked once, and only
+  // when interactive and nothing is stored yet. A stored choice (even a damaged file) is kept as it is.
+  let crossTurnWanted = null;
+  const crossTurnState = args.export ? null : readCrossTurn(home);
+  if (args['cross-turn']) crossTurnWanted = args['cross-turn'] === 'on';
+  else if (crossTurnState && !crossTurnState.configured && !args.yes && seams.interactive()) {
+    crossTurnWanted = ['y', 'yes'].includes((await seams.ask(crossTurnQuestion(crossTurn.platform))).trim().toLowerCase());
+  }
   const approvalAction = approvalMode === 'auto' ? 'auto' : args.approval === 'ask' ? 'ask' : null;
   const command = [...desktopCommand, ...runtimeFlags(chrome, audio)];
   if (args.export) say(`Export tools to ${args.export}`);
@@ -1104,6 +1172,10 @@ async function registerLocked(args, account, home, names, missing, register, pat
     if (names.length) say(`Configure ${names.join(', ')} for ${account.name} (${args.scope} scope).`);
     say('Existing LCU MCP entries will be updated and any old LCU skill removed; unrelated configuration is preserved.');
     if (names.includes('codex')) say('Codex: install and trust the original Stop, Interrupt, and SubagentStop cleanup hooks for LCU.');
+    if (names.includes('dsh')) {
+      say(`DeepSeek Harness: install LCU's plugin into profile ${args['dsh-profile'] ?? DSH_DEFAULT_PROFILE} with \`dsh plugin add\` ` +
+        '(experimental; quit DeepSeek Harness Desktop first).');
+    }
   }
   if (chrome) {
     say('Chrome control selected: register the original extension connector for this desktop account and include Chrome guidance.');
@@ -1114,20 +1186,45 @@ async function registerLocked(args, account, home, names, missing, register, pat
   if (approvalMode === 'auto' && !args.export) {
     const entries = { 'claude-code': 'Claude Code: allow `mcp__lcu__js` and `mcp__lcu__js_reset`',
       codex: 'Codex: `approval_mode = "approve"` for the `js` and `js_reset` tools of `[mcp_servers.lcu]`',
-      omp: 'Oh My Pi: `tools.approval` `js` and `js_reset` set to `allow`' };
+      omp: 'Oh My Pi: `tools.approval` `js` and `js_reset` set to `allow`',
+      junie: 'Junie: allowlist `mcpTools` rules for exactly `lcu:js` and `lcu:js_reset`' };
     const chosen = names.filter((name) => entries[name]).map((name) => entries[name]);
     say('Approval mode auto: add only LCU\'s own entries so its tools run without a per-call harness prompt' +
       (chosen.length ? `: ${chosen.join('; ')}` : '') + '. ' +
-      (names.some((name) => name === 'pi' || name === 'hermes') ? 'Pi and Hermes have no such gate. ' : '') +
+      (names.some((name) => name === 'pi' || name === 'hermes' || name === 'dsh') ? 'Pi, Hermes and DeepSeek Harness have no such gate. ' : '') +
       'Native-app and Chrome approvals from the original runtime are unchanged.');
   } else if (approvalAction === 'ask' && !args.export) {
     say('Approval mode ask: remove only the entries `--approval auto` added, restoring harness defaults.');
+  }
+  if (crossTurnState) {
+    if (crossTurnState.problem) warn(`lcu cross-turn: ${crossTurnState.problem}`);
+    if (crossTurnWanted === null) {
+      say(`Cross-turn Computer Use: ${crossTurnState.enabled ? 'on' : 'off'}, unchanged (\`lcu cross-turn on|off\` changes it).`);
+    } else if (crossTurnWanted === crossTurnState.enabled && crossTurnState.configured && !crossTurnState.problem) {
+      say(`Cross-turn Computer Use: already ${crossTurnWanted ? 'on' : 'off'}.`);
+    } else {
+      say(`Cross-turn Computer Use: turn ${crossTurnWanted ? 'on' : 'off'}${crossTurnWanted && !args.unattended && (crossTurn.platform ?? process.platform) === 'darwin'
+        ? ' (asks for Touch ID or your password)' : ''}. ${approvalNote(crossTurn.platform)}`);
+    }
   }
   if (audio) say('Computer audio selected: enable the original optional recording API and its approval flow. A saved audio file is not model audio input.');
   if (windows() && names.includes('claude-code')) {
     say('Claude Code: original turn cleanup runs on normal Stop and active MCP-call cancellation. Esc during model wait after a tool completes has no cleanup event and may leave native helpers active.');
   }
   await (await import('./tested.mjs')).report(releaseRoot, { write: (text) => say(text.trimEnd()) });
+  if (names.includes('junie') && !args.export) {
+    // Shown to the person only: Junie lets the model run `lcu apps allow` itself, so approvals outlive the task.
+    warn(JUNIE_APPROVAL_WARNING);
+    if (!args.yes && seams.interactive() &&
+      !['y', 'yes'].includes((await seams.ask(JUNIE_CONTINUE_QUESTION)).trim().toLowerCase())) {
+      names = names.filter((name) => name !== 'junie');
+      say('Junie skipped; it will not be registered.');
+      if (!names.length) {
+        say('Cancelled; no agent configuration changed.');
+        return 'cancelled';
+      }
+    }
+  }
   if (!args.yes) {
     if (!seams.interactive()) throw new Error('Review the selection above, then rerun with --yes for noninteractive setup.');
     if (!['y', 'yes'].includes((await seams.ask('Apply this setup? [y/N] ')).trim().toLowerCase())) {
@@ -1142,7 +1239,8 @@ async function registerLocked(args, account, home, names, missing, register, pat
   if (args.export) await exportBundle(args.export, command, releaseRoot, { chrome, audio });
   else if (names.length) {
     failures = await register(names, home, command, toolsRoot, releaseRoot, { scope: args.scope,
-      project: args.project ?? null, setupCommand, approval: approvalAction, environ: setupEnvironment });
+      project: args.project ?? null, setupCommand, approval: approvalAction, environ: setupEnvironment,
+      dshProfile: args['dsh-profile'] ?? DSH_DEFAULT_PROFILE });
   }
   // Remember opt-ins even when registration failed, so a retry or `--reconcile` keeps them. Harnesses registered
   // now leave the pending set; a later reconcile applies the saved chrome, audio and approval mode to the rest.
@@ -1150,15 +1248,31 @@ async function registerLocked(args, account, home, names, missing, register, pat
   const failed = [...new Set(failures.map(([name]) => name))];
   const pending = args.export ? [] : [...new Set([...state.pending, ...missing])]
     .filter((name) => !names.includes(name) || failed.includes(name));
+  // A DSH profile other than the default is kept for the reconcile that registers a pending DSH. A run without
+  // --dsh-profile keeps the profile saved for it.
+  const dshProfile = args['dsh-profile'] ?? state.pending_context?.dsh_profile;
+  const dshContext = pending.includes('dsh') && dshProfile && dshProfile !== DSH_DEFAULT_PROFILE
+    ? { dsh_profile: dshProfile } : {};
   saveSetupState(home, { chrome, audio, approval: approvalMode, pending, pendingContext: pending.length
-    ? (missing.length ? { scope: args.scope, session: args.session, project: args.project ?? null } : state.pending_context) : null });
+    ? (missing.length ? { scope: args.scope, session: args.session, project: args.project ?? null, ...dshContext } : state.pending_context) : null });
+  if (crossTurnWanted !== null) {
+    // A failed or cancelled owner authentication leaves the setting as it was and does not fail the rest of setup.
+    try {
+      const done = await setCrossTurn(home, crossTurnWanted, { root: releaseRoot, unattended: args.unattended, ...crossTurn });
+      if (done.note) warn(done.note);
+      say(done.changed ? `Cross-turn Computer Use is now ${done.enabled ? 'on' : 'off'}.` : `Cross-turn Computer Use stays ${done.enabled ? 'on' : 'off'}.`);
+    } catch (error) {
+      warn(`Cross-turn Computer Use unchanged: ${error.message}`, 'Retry with `lcu cross-turn on` or `lcu setup --cross-turn on`.');
+    }
+  }
   if (failures.length) {
     const retry = [setupCommand, 'setup', '--prefix', args.prefix, ...(args.user ? ['--user', account.name] : []), '--scope', args.scope,
       '--session', args.session, '--yes', ...(args.project ? ['--project', args.project] : []),
       chrome ? '--chrome' : '--no-chrome', audio ? '--audio' : '--no-audio',
       // A defaulted `ask` must not be passed: it would remove approval entries.
       ...(args.approval || approvalMode === 'auto' ? ['--approval', approvalMode] : []),
-      ...(args['allow-missing'] ? ['--allow-missing'] : []), ...failed.flatMap((name) => ['--agent', name])];
+      ...(args['allow-missing'] ? ['--allow-missing'] : []), ...(args['dsh-profile'] && failed.includes('dsh') ? ['--dsh-profile', args['dsh-profile']] : []),
+      ...failed.flatMap((name) => ['--agent', name])];
     throw new Error(`${failures.length} registration step(s) failed (${failures.map(([name, phase]) => `${name}: ${phase}`).join(', ')}). ` +
       `Choices were saved; completed steps remain installed. After resolving the errors, retry: ${shellJoin(retry)}`);
   }

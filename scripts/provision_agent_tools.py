@@ -37,9 +37,11 @@ def provision(release, source, *, target='linux', mac_node=None, adapters_source
         raise ValueError(f'Agent installer runtime requires {target} arm64 or x64.')
     destination = release / 'agent-tools'
     destination.mkdir()
-    # Keep download/cache off /tmp (often a small tmpfs in VM images).
+    # Keep download/cache off /tmp (often a small tmpfs in VM images) but outside the release, because
+    # Windows can refuse to remove it while antivirus holds a file, and whatever remains must not ship.
     try:
-        with tempfile.TemporaryDirectory(prefix='.agent-tools-', dir=release) as temporary:
+        with tempfile.TemporaryDirectory(prefix='.agent-tools-', dir=release.parent,
+                                         ignore_cleanup_errors=True) as temporary:
             scratch = Path(temporary)
             if target == 'linux':
                 name = f'node-v{NODE_VERSION}-linux-{architecture}'
@@ -92,7 +94,8 @@ def provision(release, source, *, target='linux', mac_node=None, adapters_source
                 adapters = release / 'adapters'
                 adapters.mkdir()
                 for filename in ('package.json', 'package-lock.json', 'client.mjs', 'claude.mjs',
-                                 'audio-files.mjs', 'codex.mjs', 'diagnostics.mjs', 'host-guard.mjs'):
+                                 'audio-files.mjs', 'codex.mjs', 'diagnostics.mjs', 'host-guard.mjs',
+                                 'cross-turn.mjs', 'junie.mjs'):
                     shutil.copy2(adapters_source / filename, adapters / filename)
                 shutil.copytree(adapters_source / 'claude-mod', adapters / 'claude-mod',
                                 ignore=shutil.ignore_patterns('node_modules', 'tests', '.DS_Store'))
@@ -101,6 +104,8 @@ def provision(release, source, *, target='linux', mac_node=None, adapters_source
                 (adapters / 'hermes').mkdir()
                 for filename in ('plugin.yaml', '__init__.py', 'bridge.mjs'):
                     shutil.copy2(adapters_source / 'hermes' / filename, adapters / 'hermes' / filename)
+                (adapters / 'dsh').mkdir()
+                shutil.copy2(adapters_source / 'dsh/plugin.mjs', adapters / 'dsh/plugin.mjs')
                 subprocess.run([str(node), str(npm), 'ci',
                                 '--cache', str(scratch / 'npm-cache'), '--omit=dev', '--omit=peer',
                                 *(['--no-bin-links'] if target == 'windows' else []),

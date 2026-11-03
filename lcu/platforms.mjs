@@ -1,14 +1,16 @@
 // Validate an installed official application for the original CUA runtime.
 // Builtins come from process.getBuiltinModule: an ESM import of a builtin builds its export facade, which
 // costs milliseconds on every launch; child_process, crypto and tty are loaded only where they are used.
-const { accessSync, constants, existsSync, lstatSync, readdirSync, readFileSync, realpathSync} = process.getBuiltinModule('node:fs');
+const { accessSync, constants, existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } = process.getBuiltinModule('node:fs');
 const os = process.getBuiltinModule('node:os');
 const { basename, dirname, join, relative, resolve } = process.getBuiltinModule('node:path');
 const childProcess = () => process.getBuiltinModule('node:child_process');
 
 import { locateCodexTools } from './app_layout.mjs';
 import { readAsarMembers } from './asar.mjs';
+import { cacheDirectory, checkOnce, recorded, writeRecord } from './check_record.mjs';
 import { isDirectory, isLink, isRegular, within } from './fsutil.mjs';
+import { tryAcquire } from './lock.mjs';
 
 const MAC_BUNDLE_ID = 'com.openai.codex';
 const MAC_HELPER_ID = 'com.openai.sky.CUAService';
@@ -131,15 +133,87 @@ function bundleIdentity(bundle, identifier) {
   return details;
 }
 
-function verifySignature(bundle, identifier) {
-  // `codesign` verifies sealed resources and nested code in place. The installed app and signed
-  // helper are never copied or modified by LCU.
+/**
+ * Where LCU remembers each bundle `codesign --verify --deep --strict` accepted, so that a launch skips that check
+ * (over a second for the app, and several when launches run at once) until the bundle changes. A per-account
+ * cache: losing it costs one deep check. A launch waits at most `wait` milliseconds for another process that is
+ * checking the same app, then checks it itself. `lock` returns a function that releases it, or null while another
+ * process holds it. Tests replace all three.
+ */
+export const sealRecord = {
+  path: () => join(cacheDirectory(), 'macos-signatures.json'),
+  wait: 15_000,
+  lock: (path) => tryAcquire(path),
+};
+
+/**
+ * One signed build of `bundle`: its identifier, version and build, its Info.plist file, and the hash of its
+ * sealed-resource manifest. An app update changes these; null when they cannot be read.
+ */
+function sealKey(bundle, details) {
+  try {
+    const info = statSync(join(bundle, 'Contents/Info.plist'));
+    const seal = readFileSync(join(bundle, 'Contents/_CodeSignature/CodeResources'));
+    return JSON.stringify({ identifier: details.CFBundleIdentifier, version: details.CFBundleShortVersionString ?? null,
+      build: details.CFBundleVersion ?? null, info: [info.ino, info.size, info.mtimeMs],
+      seal: process.getBuiltinModule('node:crypto').createHash('sha256').update(seal).digest('hex') });
+  } catch {
+    return null;
+  }
+}
+
+/** The bundle's sealKey as it is now, its Info.plist read again; null when it cannot be read. */
+function currentKey(bundle) {
+  try {
+    return sealKey(bundle, plistStrings(readFileSync(join(bundle, 'Contents/Info.plist'))));
+  } catch {
+    return null;
+  }
+}
+
+function deepVerify(bundle) {
   const verified = childProcess().spawnSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', bundle],
     { encoding: 'utf8', timeout: 120_000 });
   if (verified.status !== 0) {
     const detail = `${verified.stderr || verified.stdout || verified.error?.message || ''}`.trim().replaceAll('\n', ' ').slice(0, 300);
     throw new Error(`Installed application signature verification failed: ${bundle}: ${detail}`);
   }
+}
+
+/**
+ * Verify the bundle's seal with `codesign --verify --deep --strict`, unless `reuse` is set and this account
+ * recorded a successful check of the same build (sealKey). Concurrent launches share one check through a lock
+ * beside the record. Only a successful check whose key did not change meanwhile is recorded.
+ */
+function verifySeal(bundle, details, reuse) {
+  const key = sealKey(bundle, details);
+  if (key === null) {
+    deepVerify(bundle);
+    return;
+  }
+  let waited = false;
+  checkOnce(sealRecord, {
+    hit: (path) => {
+      if (!reuse) return false;
+      const initial = !waited;
+      waited = true;
+      if (!recorded(path, bundle, key)) return false;
+      // A record another launch wrote while this one waited: the bundle may have changed during the wait.
+      return initial || currentKey(bundle) === key;
+    },
+    check: (path) => {
+      deepVerify(bundle);
+      if (path !== null && sealKey(bundle, details) === key) writeRecord(path, bundle, key);
+    },
+  });
+}
+
+/**
+ * The installed app and signed helper are checked in place; LCU never copies or modifies them. The signer's
+ * identity and team are read on every call.
+ */
+function verifySignature(bundle, identifier, details, reuse) {
+  verifySeal(bundle, details, reuse);
   const identity = childProcess().spawnSync('/usr/bin/codesign', ['-dv', '--verbose=2', bundle],
     { encoding: 'utf8', timeout: 30_000 });
   const lines = `${identity.stderr ?? ''}`.split('\n');
@@ -159,10 +233,12 @@ function runtimeManifest(path, platform, arch, message) {
 }
 
 /**
- * Validate a local ChatGPT.app without relocating or modifying signed files. Each signature is
- * checked once. Returns `{app, resources, runtime, backend, version, arch, codexCli, codeModeHost, runtimeVersion}`.
+ * Validate a local ChatGPT.app without relocating or modifying signed files. Each signature is checked at most
+ * once; with `reuseRecordedSeal` (launches), the deep check is skipped for a build this account already verified,
+ * while installs, updates, `lcu doctor` and the other commands check in full. Returns
+ * `{app, resources, runtime, backend, version, arch, codexCli, codeModeHost, runtimeVersion}`.
  */
-export function resolveInstalledMacApp(appPath, { arch } = {}) {
+export function resolveInstalledMacApp(appPath, { arch, reuseRecordedSeal = false } = {}) {
   if (process.platform !== 'darwin') throw new Error('The macOS application can only be validated on macOS');
   if (isLink(appPath) || !isDirectory(appPath) || basename(appPath) !== 'ChatGPT.app') {
     throw new Error(`Expected a local ChatGPT.app directory: ${appPath}`);
@@ -173,10 +249,11 @@ export function resolveInstalledMacApp(appPath, { arch } = {}) {
   const contents = join(app, 'Contents');
   const resources = join(contents, 'Resources');
   const runtime = join(resources, 'cua_node');
-  const version = bundleIdentity(app, MAC_BUNDLE_ID).CFBundleShortVersionString;
+  const appDetails = bundleIdentity(app, MAC_BUNDLE_ID);
+  const version = appDetails.CFBundleShortVersionString;
   if (typeof version !== 'string' || !version.trim()) throw new Error(`Installed application version is missing: ${app}`);
   const helper = join(contents, MAC_HELPER);
-  bundleIdentity(helper, MAC_HELPER_ID);
+  const helperDetails = bundleIdentity(helper, MAC_HELPER_ID);
   const manifest = join(runtime, 'manifest.json');
   if (!isRegular(manifest)) throw new Error('Installed application CUA manifest is missing');
   const runtimeVersion = runtimeManifest(manifest, 'darwin', architecture,
@@ -192,8 +269,8 @@ export function resolveInstalledMacApp(appPath, { arch } = {}) {
   for (const file of [tools.cli, tools.codeModeHost]) {
     if (!executable(file)) throw new Error(`Installed application executable is not executable: ${relative(contents, file)}`);
   }
-  verifySignature(app, MAC_BUNDLE_ID);
-  verifySignature(helper, MAC_HELPER_ID);
+  verifySignature(app, MAC_BUNDLE_ID, appDetails, reuseRecordedSeal);
+  verifySignature(helper, MAC_HELPER_ID, helperDetails, reuseRecordedSeal);
   return { app, resources, runtime, backend: 'mac', version, arch: architecture,
     codexCli: tools.cli, codeModeHost: tools.codeModeHost, runtimeVersion };
 }

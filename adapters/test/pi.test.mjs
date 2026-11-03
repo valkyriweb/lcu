@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import piExtension from '../pi/index.ts';
@@ -682,6 +682,84 @@ test('Pi deduplicates agent_end cleanup when shutdown overlaps it', async () => 
     else process.env.LCU_MCP_COMMAND = oldCommand;
     if (oldLog === undefined) delete process.env.LCU_FIXTURE_LOG;
     else process.env.LCU_FIXTURE_LOG = oldLog;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Pi does not start another host to end a turn when the host never connected', async () => {
+  const oldCommand = process.env.LCU_MCP_COMMAND;
+  const oldSpawns = process.env.LCU_TEST_SPAWN_LOG;
+  const directory = mkdtempSync(join(tmpdir(), 'lcu-pi-noconnect-'));
+  const spawns = join(directory, 'spawns');
+  // A host that exits at once: connect() fails, as it does when a start outlasts the connect timeout.
+  process.env.LCU_MCP_COMMAND = JSON.stringify([process.execPath, '-e',
+    "require('node:fs').appendFileSync(process.env.LCU_TEST_SPAWN_LOG, 'x'); process.exit(1)"]);
+  process.env.LCU_TEST_SPAWN_LOG = spawns;
+  const handlers = new Map();
+  const pi = { on(event, handler) { handlers.set(event, handler); }, registerTool() {}, registerCommand() {} };
+  const warnings = [];
+  const ctx = { sessionManager: { getSessionId: () => 'noconnect-session' }, hasUI: false,
+    ui: { notify: (message, level) => warnings.push({ message, level }) } };
+  try {
+    piExtension(pi);
+    await assert.rejects(handlers.get('before_agent_start')({ systemPrompt: 'Pi' }, ctx));
+    await handlers.get('agent_start')({}, ctx);
+    await handlers.get('agent_end')({ messages: [{ role: 'assistant', stopReason: 'stop' }] }, ctx);
+    await handlers.get('session_shutdown')();
+    assert.deepEqual(warnings, []);
+    assert.equal(readFileSync(spawns, 'utf8'), 'x');
+  } finally {
+    if (oldCommand === undefined) delete process.env.LCU_MCP_COMMAND;
+    else process.env.LCU_MCP_COMMAND = oldCommand;
+    if (oldSpawns === undefined) delete process.env.LCU_TEST_SPAWN_LOG;
+    else process.env.LCU_TEST_SPAWN_LOG = oldSpawns;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Pi shows the cached update notice to the person at session start, never to the model',
+  { skip: process.platform === 'win32' && 'the release launcher is a POSIX script' }, async () => {
+  const oldCommand = process.env.LCU_MCP_COMMAND;
+  const directory = mkdtempSync(join(tmpdir(), 'lcu-pi-notice-'));
+  // A release-shaped tree: bin/lcu records its arguments and prints what `lcu update --notice --json` would.
+  const out = join(directory, 'out.json');
+  const args = join(directory, 'args');
+  mkdirSync(join(directory, 'bin'));
+  mkdirSync(join(directory, 'lcu'));
+  writeFileSync(join(directory, 'lcu', 'runtime.mjs'), '');
+  writeFileSync(join(directory, 'bin', 'lcu'), `#!/bin/sh\nprintf '%s\\n' "$@" >> '${args}'\ncat '${out}'\n`, { mode: 0o755 });
+  process.env.LCU_MCP_COMMAND = JSON.stringify([join(directory, 'bin', 'lcu')]);
+  const handlers = new Map();
+  const pi = { on(event, handler) { handlers.set(event, handler); }, registerTool() {}, registerCommand() {} };
+  const notes = [];
+  const ctx = (hasUI) => ({ sessionManager: { getSessionId: () => 'pi-notice-session' }, hasUI,
+    ui: { notify: (message, level) => notes.push({ message, level }) } });
+  const message = 'LCU 0.9.2 is available (installed: 0.9.1). Run `lcu update`, then restart the agents that use LCU.';
+  try {
+    piExtension(pi);
+    const start = handlers.get('session_start');
+    writeFileSync(out, JSON.stringify({ latest: '0.9.2', severity: 'normal', message }));
+    assert.equal(await start({ type: 'session_start', reason: 'startup' }, ctx(false)), undefined);
+    assert.equal(existsSync(args), false); // no UI: lcu is not asked, so the announcement is not used up
+    assert.equal(await start({ type: 'session_start', reason: 'startup' }, ctx(true)), undefined);
+    assert.deepEqual(readFileSync(args, 'utf8').trim().split('\n'),
+      ['update', '--notice', '--json', '--announce=pi-notice-session']);
+    assert.deepEqual(notes, [{ message, level: 'info' }]);
+    writeFileSync(out, JSON.stringify({ latest: '0.9.3', severity: 'security', message: `Security update: ${message}` }));
+    await start({ type: 'session_start', reason: 'resume' }, ctx(true));
+    assert.deepEqual(notes.at(-1), { message: `Security update: ${message}`, level: 'warning' });
+    for (const quiet of ['{}', 'not json', '[1]']) {
+      writeFileSync(out, quiet);
+      await start({ type: 'session_start', reason: 'new' }, ctx(true));
+    }
+    assert.equal(notes.length, 2);
+    // A command that is not a release launcher is never run for the notice.
+    process.env.LCU_MCP_COMMAND = JSON.stringify([process.execPath, '-e', 'process.exit(1)']);
+    await start({ type: 'session_start', reason: 'new' }, ctx(true));
+    assert.equal(notes.length, 2);
+  } finally {
+    if (oldCommand === undefined) delete process.env.LCU_MCP_COMMAND;
+    else process.env.LCU_MCP_COMMAND = oldCommand;
     rmSync(directory, { recursive: true, force: true });
   }
 });

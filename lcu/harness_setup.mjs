@@ -1,10 +1,13 @@
-// Local harness packages for Oh My Pi and Hermes; host configuration remains with their native installers.
+// Local harness packages for Oh My Pi, Hermes and DeepSeek Harness, whose host configuration remains with their native
+// installers, and the Junie registration, which has no installer.
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 
-import { real } from './fsutil.mjs';
-import { checked, json, regularPath, seams, spacedJson } from './setup.mjs';
+import { real, shellQuote } from './fsutil.mjs';
+import { applyChanges, change, checked, json, member, parseJson, readFile, regularPath, seams, spacedJson } from './setup.mjs';
 
 const MARKER = '.lcu-generated.json';
 
@@ -95,3 +98,170 @@ export function configureHermes(home, command, node, release, { scope, env }) {
     () => checked('installer', executable, ['plugins', 'enable', 'lcu-cua'], { cwd: home, env: { ...env, HERMES_HOME: root }, timeout: 120_000 }));
 }
 
+
+// DeepSeek Harness ------------------------------------------------------------------------------------------
+
+export const DSH_PACKAGE = 'lcu-computer-use';
+export const DSH_DEFAULT_PROFILE = 'desktop';
+// The DSH runtimes LCU's plugin was written against; DSH refuses the bundle elsewhere unless the user exempts it.
+const DSH_ENGINES = '>=0.2.1-rc.2 <0.3';
+const DSH_CLI = 'Contents/Resources/runtime/cli/bin/dsh';
+// DSH Desktop's main executable. Its `dsh` CLI runs the same binary on `dsh-desktop-host/lib/cli.js`.
+const DSH_DESKTOP = /\/DeepSeek Harness\.app\/Contents\/MacOS\/DeepSeek Harness(?: |$)/;
+
+/** DSH's own profile names: one path segment. */
+export const validDshProfile = (name) => typeof name === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name);
+
+/** The `dsh` CLI: `dsh` on `path`, else the launcher inside an installed DeepSeek Harness app (macOS). */
+export function dshExecutable(home, path) {
+  const found = seams.which('dsh', path);
+  if (found) return found;
+  for (const app of seams.dshApps(home)) {
+    const candidate = join(app, DSH_CLI);
+    try {
+      if (!statSync(candidate).isFile()) continue;
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // not here
+    }
+  }
+  return null;
+}
+
+/** Whether a `ps -axww -o command=` listing shows DSH Desktop (not only the `dsh` CLI on the same binary). */
+export const dshDesktopListed = (listing) => listing.split('\n')
+  .some((line) => DSH_DESKTOP.test(line) && !line.includes('/dsh-desktop-host/lib/cli.js'));
+
+function dshDesktopRunning() {
+  if (process.platform !== 'darwin') return false;
+  const result = seams.run('/bin/ps', ['-axww', '-o', 'command='], { timeout: 20_000 });
+  if (result.error || result.status !== 0) throw new Error('Could not check whether DeepSeek Harness Desktop is running.');
+  return dshDesktopListed(result.stdout ?? '');
+}
+
+// An original mark: a pointer over a window.
+const DSH_ICON = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">' +
+  '<rect x="6" y="10" width="52" height="40" rx="6" fill="#1f2937"/><rect x="6" y="10" width="52" height="8" rx="4" fill="#4b5563"/>' +
+  '<path d="M26 24 L26 50 L32 44 L37 55 L42 53 L37 42 L45 42 Z" fill="#f9fafb" stroke="#111827" stroke-width="2" stroke-linejoin="round"/>' +
+  '</svg>\n';
+
+/**
+ * Generate LCU's DSH bundle for one profile and install it with DSH's own `dsh plugin --profile P add DIR`, which
+ * links the directory into the profile. Its `index.js` imports DSH's MCP tool helper: DSH resolves its own packages
+ * for a linked bundle's files that declare them as peers, not for LCU's release files.
+ */
+export function configureDsh(home, command, release, { scope, env, profile = DSH_DEFAULT_PROFILE }) {
+  if (scope !== 'user') {
+    throw new Error('DeepSeek Harness plugins are profile-scoped. Use --scope user with --dsh-profile; project scope is not supported.');
+  }
+  if (!validDshProfile(profile)) throw new Error(`Invalid DeepSeek Harness profile name: ${profile}`);
+  const executable = dshExecutable(home, env.PATH);
+  if (!executable) {
+    throw new Error('DeepSeek Harness was not found: no `dsh` on the target account PATH and no DeepSeek Harness app. ' +
+      'Install it, then rerun `lcu setup --agent dsh`.');
+  }
+  const root = env.DSH_HOME || join(home, '.dsh');
+  if (!isAbsolute(root)) throw new Error('DSH_HOME must be absolute.');
+  if (profile === DSH_DEFAULT_PROFILE && dshDesktopRunning()) {
+    throw new Error('DeepSeek Harness Desktop is running. DSH changes its desktop profile only while the app is closed: ' +
+      'quit DeepSeek Harness, rerun `lcu setup --agent dsh`, then open it again.');
+  }
+  const adapter = join(release, 'adapters/dsh/plugin.mjs');
+  if (!existsSync(adapter)) throw new Error(`LCU DSH plugin missing: ${adapter}`);
+  const suffix = createHash('sha256').update(spacedJson([profile, real(root)])).digest('hex').slice(0, 16);
+  const data = join(home, process.platform === 'win32' ? 'AppData/Local/LCU' : '.local/share/lcu');
+  const destination = join(data, 'dsh', `${profile}-${suffix}`);
+  // An import specifier is a URL: each relative segment is percent-encoded so `#`, `?` and `%` stay in the path.
+  let specifier = relative(destination, adapter);
+  if (isAbsolute(specifier)) specifier = pathToFileURL(adapter).href;
+  else {
+    specifier = specifier.split(/[\\/]/).map(encodeURIComponent).join('/');
+    if (!specifier.startsWith('.')) specifier = `./${specifier}`;
+  }
+  const manifest = {
+    name: DSH_PACKAGE, version: '0.1.0', private: true, type: 'module',
+    description: 'LCU: computer use through the installed OpenAI computer-use runtime.',
+    exports: { '.': './index.js', './locale/*.json': './locale/*.json', './icon': './icon.svg' },
+    files: ['index.js', 'cordis.patch.yml', 'locale/*.json', 'icon.svg'],
+    engines: { dsh: DSH_ENGINES },
+    peerDependencies: { '@deepseek-ai/dsh-mcp-client': '*' },
+    dsh: { bundle: { patch: './cordis.patch.yml' } },
+  };
+  // JSON is YAML: the row's config is the runtime command, as the other generated packages carry it.
+  const patch = `- insert:\n    - id: ${DSH_PACKAGE}\n      name: ${DSH_PACKAGE}\n      config: ${JSON.stringify({ command })}\n`;
+  const wrapper = '// Generated by `lcu setup --agent dsh`; rerun setup instead of editing.\n' +
+    "import { createMcpToolDefinition } from '@deepseek-ai/dsh-mcp-client';\n" +
+    `import * as lcu from ${JSON.stringify(specifier)};\n\n` +
+    'export const name = lcu.name;\nexport const inject = lcu.inject;\n' +
+    // Async: Cordis 4 constructs a plugin function that has a prototype instead of awaiting it, so the first agent
+    // request could start before LCU's tools are registered.
+    'export async function apply(ctx, config) {\n  return lcu.apply(ctx, config, { createMcpToolDefinition });\n}\n';
+  const locale = { meta: { title: 'LCU Computer Use',
+    description: 'Controls desktop apps through the computer-use runtime of the installed ChatGPT app.' } };
+  withPackage(destination, 'dsh', { 'package.json': json(manifest), 'cordis.patch.yml': patch, 'index.js': wrapper,
+    'locale/en.json': json(locale), 'icon.svg': DSH_ICON },
+  (pkg) => checked('installer', executable, ['plugin', '--profile', profile, 'add', pkg], { cwd: home, env, timeout: 300_000 }));
+  return { profile, destination };
+}
+
+
+// Junie --------------------------------------------------------------------------------------------------
+
+export const JUNIE_SERVER = 'lcu';
+/** The Junie hook events the relay's `--hook` mode handles, with Junie's timeout for each, in seconds. */
+export const JUNIE_HOOKS = { SessionStart: 10, UserPromptSubmit: 30, Stop: 60, StopFailure: 60, SessionEnd: 10 };
+// Junie's default MCP request timeout, 60 s, also bounds each tool call; the relay bounds its own calls.
+const JUNIE_MCP_TIMEOUT_MS = 3_600_000;
+const JUNIE_HOOK = /(^|[\\/])adapters[\\/]junie\.mjs'? --hook$/;
+
+const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+/** Whether a Junie hook entry is one LCU wrote, from any release. */
+export const isJunieHook = (hook) => isObject(hook) && hook.type === 'command' && typeof hook.command === 'string' &&
+  JUNIE_HOOK.test(hook.command);
+
+/**
+ * Register the Junie relay as the `lcu` server of `~/.junie/mcp/mcp.json` and its hooks in `~/.junie/config.json`,
+ * replacing only LCU's own entries. Junie has no installer for either; it reads both files as written here.
+ * Project scope is rejected: Junie ignores a project's config.json hooks unless it is started with that file.
+ */
+export function configureJunie(home, command, node, release, { scope }) {
+  if (process.platform === 'win32') throw new Error('Junie is not supported on Windows yet.');
+  if (scope !== 'user') {
+    throw new Error('Junie runs hooks only from ~/.junie/config.json, which LCU needs to end its turns. Use --scope user; project scope is not supported.');
+  }
+  const adapter = join(release, 'adapters/junie.mjs');
+  if (!existsSync(adapter)) throw new Error(`LCU Junie relay missing: ${adapter}`);
+  const mcpPath = join(home, '.junie/mcp/mcp.json');
+  const configPath = join(home, '.junie/config.json');
+
+  const mcpBefore = readFile(mcpPath);
+  const mcp = parseJson(mcpBefore);
+  if (!isObject(mcp)) throw new Error(`Junie MCP configuration must be an object: ${mcpPath}`);
+  const servers = member(mcp, 'mcpServers', {}, `Junie mcpServers must be an object: ${mcpPath}`);
+  servers[JUNIE_SERVER] = { command: String(node), args: [adapter, ...command], timeout: JUNIE_MCP_TIMEOUT_MS };
+
+  const configBefore = readFile(configPath);
+  const config = parseJson(configBefore);
+  if (!isObject(config)) throw new Error(`Junie configuration must be an object: ${configPath}`);
+  const hooks = member(config, 'hooks', {}, `Junie hooks must be an object: ${configPath}`);
+  const hookCommand = `${shellQuote(String(node))} ${shellQuote(adapter)} --hook`;
+  for (const [event, timeout] of Object.entries(JUNIE_HOOKS)) {
+    const groups = member(hooks, event, [], `Junie ${event} hooks must be an array of objects`);
+    if (!groups.every((group) => isObject(group) && Array.isArray(group.hooks))) {
+      throw new Error(`Junie ${event} hooks must be an array of objects with a hooks array: ${configPath}`);
+    }
+    // An earlier release's entry points at its own adapter path; only LCU's entries are replaced.
+    const kept = groups.map((group) => ({ ...group, hooks: group.hooks.filter((hook) => !isJunieHook(hook)) }))
+      .filter((group, index) => group.hooks.length || !groups[index].hooks.length);
+    kept.push({ hooks: [{ type: 'command', command: hookCommand, timeout }] });
+    hooks[event] = kept;
+  }
+  const changes = [];
+  if (mcpBefore === null || !isDeepStrictEqual(parseJson(mcpBefore), mcp)) changes.push(change(mcpPath, mcpBefore, json(mcp)));
+  if (configBefore === null || !isDeepStrictEqual(parseJson(configBefore), config)) {
+    changes.push(change(configPath, configBefore, json(config)));
+  }
+  applyChanges(changes);
+  return { mcpPath, configPath };
+}
