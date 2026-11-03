@@ -5,7 +5,11 @@ import { userInfo } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+import { AppsError } from '../../lcu/apps.mjs';
+import { question } from '../../lcu/cross_turn.mjs';
 import * as setup from '../../lcu/setup.mjs';
+import * as visibility from '../../lcu/claude_visibility.mjs';
+import { hardenLifecycleDirectory } from '../../lcu/claude_lifecycle.mjs';
 import { REPO, output, override, posixTests, result, temporary, write } from './fixtures.mjs';
 
 const test = posixTests('Linux/macOS setup (POSIX accounts with uid/gid, sh launchers)');
@@ -26,6 +30,7 @@ function fixture(t) {
   override(t, setup.seams, 'account', () => account);
   override(t, setup.seams, 'interactive', () => false);
   override(t, setup.seams, 'which', (name) => ([...state.installed].some((client) => setup.CLIENTS[client].executable === name) ? `/fixture/${name}` : null));
+  override(t, setup.seams, 'dshApps', () => []);
   override(t, setup.seams, 'spawn', (command, args) => {
     state.spawned.push([command, ...args]);
     return { status: 0, signal: null };
@@ -36,9 +41,17 @@ function fixture(t) {
     state.registered.push({ names: [...names], command, ...options });
     return names.filter((name) => state.failing.has(name)).map((name) => [name, 'plugin', 'boom']);
   };
+  // Cross-turn owner authentication never reaches the real macOS helper: `auth` records and approves or refuses.
+  state.authCalls = [];
+  state.approve = true;
+  state.crossTurn = { platform: 'darwin', auth: async (_root, reason) => {
+    state.authCalls.push(reason);
+    if (!state.approve) throw new AppsError('authentication was cancelled or failed. Nothing was changed.');
+  } };
   state.raw = async (...argv) => {
     const seen = await output(t);
-    const code = await setup.main(['--prefix', prefix, '--user', 'fixture', '--session', 'direct', ...argv], { configure: state.configure });
+    const code = await setup.main(['--prefix', prefix, '--user', 'fixture', '--session', 'direct', ...argv],
+      { configure: state.configure, crossTurn: state.crossTurn });
     return { code, out: seen.out, err: seen.err };
   };
   state.main = (...argv) => state.raw('--yes', '--no-chrome', ...argv);
@@ -94,9 +107,13 @@ test('validation: conflicts, scopes, agents and reconcile', (t) => {
   assert.throws(() => check('--browser-host'), /setup --agent AGENT --chrome/);
   assert.throws(() => check('--chrome', '--no-chrome', '--agent', 'codex'), /not both/);
   assert.throws(() => check('--audio', '--no-audio', '--agent', 'codex'), /not both/);
-  for (const name of ['omp', 'hermes']) {
+  for (const name of ['omp', 'hermes', 'dsh']) {
     assert.throws(() => check('--scope', 'project', '--project', root, '--agent', name), /project scope is not supported/);
   }
+  assert.deepEqual(check('--agent', 'deepseek-harness', '--dsh-profile', 'web').names, ['dsh']);
+  assert.throws(() => check('--agent', 'dsh', '--dsh-profile', '../x'), /Invalid --dsh-profile/);
+  assert.throws(() => check('--export', join(root, 'export'), '--dsh-profile', 'web'), /cannot be combined with --export/);
+  assert.throws(() => check('--reconcile', '--dsh-profile', 'web'), /cannot be combined/);
   assert.throws(() => check('--export', '/tmp/x', '--allow-missing'), /cannot be combined with --export/);
   for (const flag of [['--approval', 'auto'], ['--agent', 'pi'], ['--chrome'], ['--allow-missing'], ['--scope', 'project']]) {
     assert.throws(() => check('--reconcile', ...flag), /cannot be combined/);
@@ -114,6 +131,7 @@ test('--list-agents shows the scopes, and usage errors exit 2', async (t) => {
   assert.equal(await setup.main(['--list-agents']), 0);
   assert.match(seen.out, /omp .*\(user\)/);
   assert.match(seen.out, /hermes .*\(user\)/);
+  assert.match(seen.out, /dsh .*DeepSeek Harness \(user\)/);
   assert.match(seen.out, /codex .*\(user, project\)/);
   assert.equal(await setup.main(['--bogus']), 2);
   assert.equal(await setup.main(['--scope', 'x']), 2);
@@ -142,7 +160,7 @@ test('a chrome opt-in is saved and reused; --no-chrome turns it off; a saved dec
     return 'y';
   });
   await f.raw('--agent', 'codex');
-  assert.deepEqual(prompts, ['Apply this setup? [y/N] ']);
+  assert.deepEqual(prompts, [CROSS_TURN_QUESTION, 'Apply this setup? [y/N] ']);
   assert.ok(!f.registered.at(-1).command.includes('--chrome'));
 });
 
@@ -374,9 +392,14 @@ test('Claude Code registration forwards the command through the relay and instal
   assert.deepEqual(data.permissions.deny, ['Bash(rm *)', 'mcp__lcu__turn_ended', 'mcp__lcu__js_add_node_module_dir', 'mcp__lcu__set_turn_context']);
   assert.equal(data.hooks.UserPromptSubmit[0].hooks[0].command, 'keep-me');
   assert.equal(data.hooks.PreToolUse[0].matcher, 'mcp__lcu__js|mcp__lcu__js_reset');
-  assert.deepEqual(data.hooks.Stop[0].hooks[0].input, { hook_event_name: 'Stop', session_id: '${session_id}', turn_id: '${prompt_id}' });
+  assert.deepEqual(data.hooks.Stop[0].hooks[0], { type: 'command', command: r.node,
+    args: [join(r.home, '.local/share/lcu/claude/claude-hook.mjs')], timeout: 600 });
   await register('user', base);
   assert.ok(readFileSync(join(r.home, '.claude/settings.json')).equals(configured));
+  const appNode = join(r.release, 'selected app', 'node');
+  write(join(r.release, 'node-path'), appNode + '\n');
+  await register('user', base);
+  assert.equal(JSON.parse(readFileSync(join(r.home, '.claude/settings.json'), 'utf8')).hooks.Stop[0].hooks[0].command, appNode);
   const projectCommand = [...base, '--chrome', '--audio'];
   assert.deepEqual(await register('project', projectCommand), [r.node, join(r.release, 'adapters/claude.mjs'), ...projectCommand]);
   assert.deepEqual(JSON.parse(readFileSync(join(project, '.claude/settings.local.json'), 'utf8')).permissions.deny,
@@ -384,6 +407,43 @@ test('Claude Code registration forwards the command through the relay and instal
   assert.equal(existsSync(join(project, '.claude/settings.json')), false);
   assert.ok(existsSync(join(r.home, '.claude/skills/lcu-approve/.claude-plugin/plugin.json')));
   assert.ok(existsSync(join(project, '.claude/skills/lcu-approve/hooks/register.tsx')));
+});
+
+for (const code of ['EACCES', 'ETIMEDOUT']) {
+  test(`Claude setup completes helper, hooks and approval mod installation when ACL hardening fails with ${code}`, async t => {
+    const r = release(t);
+    write(join(r.release, 'adapters/claude.mjs'), 'fixture relay');
+    cpSync(join(REPO, 'adapters/claude-mod'), join(r.release, 'adapters/claude-mod'), { recursive: true });
+    let attempts = 0;
+    override(t, visibility.seams, 'harden', directory => hardenLifecycleDirectory(directory, { runAcl() {
+      attempts++;
+      throw Object.assign(new Error('injected ACL failure'), { code });
+    } }));
+    override(t, setup.seams, 'run', () => result(0, '{}'));
+    const seen = await output(t);
+    const failures = await setup.configure(['claude-code'], r.home, ['/usr/bin/lcu'], r.tools, r.release,
+      { scope: 'user', environ: { HOME: r.home } });
+    assert.deepEqual(failures, []);
+    assert.equal(attempts, 1);
+    assert.match(seen.err, /Claude Code: could not harden lifecycle directory; continuing with inherited AppData permissions/);
+    assert.deepEqual(readFileSync(visibility.helperPath(r.home)), readFileSync(join(REPO, 'lcu/claude_hook.mjs')));
+    const settings = JSON.parse(readFileSync(join(r.home, '.claude/settings.json'), 'utf8'));
+    assert.deepEqual(settings.hooks.Stop[0], visibility.lifecycleHooks(r.home, r.node).Stop);
+    assert.ok(existsSync(join(r.home, '.claude/skills/lcu-approve/hooks/register.tsx')));
+  });
+}
+
+test('a Claude approval mod failure is its own phase: MCP stays registered and the approval mode still applies', async (t) => {
+  const r = release(t);
+  write(join(r.release, 'adapters/claude.mjs'), 'fixture relay');
+  override(t, setup.seams, 'run', () => result(0, '{}'));
+  const seen = await output(t);
+  const failures = await setup.configure(['claude-code'], r.home, ['/usr/bin/lcu'], r.tools, r.release,
+    { scope: 'user', approval: 'auto', environ: { HOME: r.home } });
+  assert.deepEqual(failures.map(([name, phase]) => [name, phase]), [['claude-code', 'approval mod']]);
+  assert.match(failures[0][2], /LCU Claude mod missing/);
+  assert.match(seen.out, /Claude Code: MCP registered\./);
+  assert.match(seen.out, /Claude Code: approval auto: /);
 });
 
 test('Codex registration wraps the command in the relay and carries the host policy', async (t) => {
@@ -453,7 +513,7 @@ test('Pi registration writes the local extension and the per-scope command, offl
   assert.deepEqual(await setup.configure(['pi'], r.home, ['/usr/bin/lcu', '--audio'], r.tools, r.release, { environ: { HOME: r.home } }), []);
   assert.equal(calls.length, 2);
   const wrapper = readFileSync(join(r.home, '.local/share/lcu/pi/extension.mjs'), 'utf8');
-  assert.ok(wrapper.includes(pathToFileURL(join(r.release, 'adapters/pi/index.ts')).href));
+  assert.ok(wrapper.startsWith(`import lcu from ${JSON.stringify(join(r.release, 'adapters/pi/index.ts'))};\n`));
   assert.ok(wrapper.includes('realpathSync(process.cwd())'));
   assert.deepEqual(JSON.parse(readFileSync(commands, 'utf8')), { projects: { '/existing/project': ['/usr/bin/lcu'] }, preserved: true, user: ['/usr/bin/lcu', '--audio'] });
 });
@@ -610,4 +670,202 @@ test('a terminal question reads one line without spinning, and is empty at the e
   assert.equal(answer.answer, 'yes');
   assert.equal(answer.end, '');
   assert.ok(answer.cpu < 300, `${answer.cpu} ms of CPU while waiting`);
+});
+
+// Cross-turn Computer Use -------------------------------------------------------------------------------
+
+const CROSS_TURN_QUESTION = question('darwin');
+const crossTurnFile = (f) => join(f.home, '.local/state/lcu/cross-turn.json');
+const crossTurnState = (f) => JSON.parse(readFileSync(crossTurnFile(f), 'utf8'));
+
+test('setup validation: --cross-turn takes on|off; --unattended needs --cross-turn on; no export or reconcile', (t) => {
+  const root = temporary(t);
+  override(t, setup.seams, 'account', () => ({ name: 'fixture', uid: process.getuid(), gid: process.getgid(), home: root }));
+  const check = (...argv) => setup.validate(setup.parse(['--user', 'fixture', ...argv]));
+  assert.throws(() => setup.parse(['--cross-turn', 'maybe']), setup.UsageError);
+  assert.throws(() => check('--agent', 'codex', '--unattended'), /only applies together with --cross-turn on/);
+  assert.throws(() => check('--agent', 'codex', '--cross-turn', 'off', '--unattended'), /only applies together with --cross-turn on/);
+  assert.throws(() => check('--export', '/tmp/new-export', '--cross-turn', 'on'), /cannot be combined with --export/);
+  assert.throws(() => check('--reconcile', '--cross-turn', 'on'), /cannot be combined/);
+  assert.throws(() => check('--reconcile', '--unattended'), /cannot be combined/);
+  assert.deepEqual(check('--agent', 'codex', '--cross-turn', 'on', '--unattended').names, ['codex']);
+  assert.match(setup.USAGE, /--cross-turn on\|off \[--unattended\]/);
+});
+
+test('--cross-turn on authenticates once on macOS, records the owner, and is idempotent', async (t) => {
+  const f = fixture(t);
+  const first = await f.main('--agent', 'codex', '--cross-turn', 'on');
+  assert.equal(first.code, 0);
+  assert.equal(f.authCalls.length, 1);
+  assert.match(first.out, /Cross-turn Computer Use is now on/);
+  assert.deepEqual([crossTurnState(f).enabled, crossTurnState(f).source], [true, 'owner']);
+  const again = await f.main('--agent', 'codex', '--cross-turn', 'on');
+  assert.equal(f.authCalls.length, 1);
+  assert.match(again.out, /already on/);
+  await f.main('--agent', 'codex', '--cross-turn', 'off');
+  assert.equal(f.authCalls.length, 1);
+  assert.equal(crossTurnState(f).enabled, false);
+  // setup.json is untouched by the setting
+  assert.deepEqual(JSON.parse(readFileSync(join(f.home, '.local/state/lcu/setup.json'), 'utf8')), { chrome: false, audio: false, approval: 'ask' });
+});
+
+test('--cross-turn on --unattended skips the prompt with a warning; Linux records cli', async (t) => {
+  const f = fixture(t);
+  const unattended = await f.main('--agent', 'codex', '--cross-turn', 'on', '--unattended');
+  assert.equal(f.authCalls.length, 0);
+  assert.equal(crossTurnState(f).source, 'unattended');
+  assert.match(unattended.err, /disposable sandbox machines/);
+  await f.main('--agent', 'codex', '--cross-turn', 'off');
+  f.crossTurn.platform = 'linux';
+  await f.main('--agent', 'codex', '--cross-turn', 'on');
+  assert.equal(f.authCalls.length, 0);
+  assert.deepEqual([crossTurnState(f).enabled, crossTurnState(f).source], [true, 'cli']);
+});
+
+test('a cancelled owner authentication leaves the setting alone and does not fail the rest of setup', async (t) => {
+  const f = fixture(t);
+  f.approve = false;
+  const { code, err, out } = await f.main('--agent', 'codex', '--cross-turn', 'on');
+  assert.equal(code, 0);
+  assert.match(err, /Cross-turn Computer Use unchanged: authentication was cancelled/);
+  assert.equal(existsSync(crossTurnFile(f)), false);
+  assert.equal(f.registered.length, 1);
+  assert.match(out, /Configuration prepared/);
+});
+
+/** A fixture whose terminal is interactive: it records every question and answers the cross-turn one with `answers.crossTurn`. */
+function interactiveFixture(t, answers) {
+  const f = fixture(t);
+  override(t, setup.seams, 'interactive', () => true);
+  override(t, setup.seams, 'ask', (question) => {
+    f.prompts.push(question);
+    return question === CROSS_TURN_QUESTION ? answers.crossTurn : answers.apply;
+  });
+  f.prompts = [];
+  return f;
+}
+
+test('interactive setup asks about cross-turn once; yes authenticates, no is recorded, --yes leaves it unchanged', async (t) => {
+  const answers = { crossTurn: 'y', apply: 'y' };
+  let f = interactiveFixture(t, answers);
+  await f.raw('--agent', 'codex', '--no-chrome');
+  assert.deepEqual(f.prompts, [CROSS_TURN_QUESTION, 'Apply this setup? [y/N] ']);
+  assert.equal(f.authCalls.length, 1);
+  assert.equal(crossTurnState(f).enabled, true);
+  f.prompts.length = 0;
+  await f.raw('--agent', 'codex', '--no-chrome');
+  assert.deepEqual(f.prompts, ['Apply this setup? [y/N] ']);
+
+  answers.crossTurn = 'n';
+  f = interactiveFixture(t, answers);
+  await f.raw('--agent', 'codex', '--no-chrome');
+  assert.equal(f.authCalls.length, 0);
+  assert.equal(crossTurnState(f).enabled, false);
+  f.prompts.length = 0;
+  await f.raw('--agent', 'codex', '--no-chrome');
+  assert.deepEqual(f.prompts, ['Apply this setup? [y/N] ']);
+
+  f = interactiveFixture(t, answers);
+  const yes = await f.raw('--agent', 'codex', '--no-chrome', '--yes');
+  assert.deepEqual(f.prompts, []);
+  assert.equal(existsSync(crossTurnFile(f)), false);
+  assert.match(yes.out, /Cross-turn Computer Use: off, unchanged/);
+});
+
+test('declining "Apply this setup?" applies no cross-turn change, and a damaged file is neither asked about nor replaced', async (t) => {
+  const answers = { crossTurn: 'y', apply: 'n' };
+  let f = interactiveFixture(t, answers);
+  await f.raw('--agent', 'codex', '--no-chrome');
+  assert.equal(existsSync(crossTurnFile(f)), false);
+  assert.equal(f.authCalls.length, 0);
+  assert.deepEqual(f.registered, []);
+
+  f = interactiveFixture(t, answers);
+  write(crossTurnFile(f), '{broken');
+  const { err } = await f.raw('--agent', 'codex', '--no-chrome');
+  assert.ok(!f.prompts.includes(CROSS_TURN_QUESTION));
+  assert.match(err, /not a valid cross-turn setting/);
+  assert.equal(readFileSync(crossTurnFile(f), 'utf8'), '{broken');
+});
+
+test('Junie setup warns that approvals last until revoked and asks to continue unless --yes', async (t) => {
+  const answers = { crossTurn: 'n', apply: 'y', junie: 'n' };
+  const junieFixture = () => {
+    const f = interactiveFixture(t, answers);
+    override(t, setup.seams, 'ask', (q) => {
+      f.prompts.push(q);
+      return q === setup.JUNIE_CONTINUE_QUESTION ? answers.junie : q === CROSS_TURN_QUESTION ? answers.crossTurn : answers.apply;
+    });
+    return f;
+  };
+  // Declined: Junie is skipped, the other harness is still registered.
+  let f = junieFixture();
+  let run = await f.raw('--agent', 'junie', '--agent', 'codex', '--no-chrome', '--cross-turn', 'off');
+  assert.equal(run.code, 0, run.err);
+  assert.ok(run.err.includes(setup.JUNIE_APPROVAL_WARNING));
+  assert.match(setup.JUNIE_APPROVAL_WARNING, /allows that app until you revoke it with `lcu apps revoke <App>`/);
+  assert.deepEqual(f.prompts, [setup.JUNIE_CONTINUE_QUESTION, 'Apply this setup? [y/N] ']);
+  assert.match(run.out, /Junie skipped/);
+  assert.deepEqual(f.registered.map((entry) => entry.names), [['codex']]);
+  // Declined with Junie alone: nothing is left to apply, so setup stops there.
+  f = junieFixture();
+  run = await f.raw('--agent', 'junie', '--no-chrome', '--cross-turn', 'off');
+  assert.deepEqual(f.prompts, [setup.JUNIE_CONTINUE_QUESTION]);
+  assert.match(run.out, /Cancelled; no agent configuration changed/);
+  assert.deepEqual(f.registered, []);
+  // Accepted: Junie is registered.
+  answers.junie = 'y';
+  f = junieFixture();
+  run = await f.raw('--agent', 'junie', '--no-chrome', '--cross-turn', 'off');
+  assert.equal(run.code, 0, run.err);
+  assert.deepEqual(f.registered.map((entry) => entry.names), [['junie']]);
+  // --yes: the warning is printed and nothing is asked.
+  f = junieFixture();
+  run = await f.raw('--agent', 'junie', '--no-chrome', '--cross-turn', 'off', '--yes');
+  assert.equal(run.code, 0, run.err);
+  assert.ok(run.err.includes(setup.JUNIE_APPROVAL_WARNING));
+  assert.deepEqual(f.prompts, []);
+  assert.deepEqual(f.registered.map((entry) => entry.names), [['junie']]);
+  // Other harnesses get no Junie warning.
+  run = await f.main('--agent', 'codex');
+  assert.ok(!run.err.includes('Junie'));
+});
+
+test('the cross-turn question names per-app approvals only where they exist', () => {
+  assert.match(question('darwin'), /Per-app approvals still apply\. \[y\/N\] $/);
+  assert.match(question('win32'), /Per-app approvals still apply/);
+  assert.match(question('linux'), /has no per-app approval/);
+  assert.doesNotMatch(question('linux'), /Per-app approvals still apply/);
+});
+
+test('--dsh-profile reaches DeepSeek Harness registration and a pending DSH keeps it for reconcile', async (t) => {
+  const f = fixture(t);
+  const done = await f.main('--agent', 'dsh', '--dsh-profile', 'web');
+  assert.equal(done.code, 0, done.err);
+  assert.deepEqual([f.registered[0].names, f.registered[0].dshProfile], [['dsh'], 'web']);
+  assert.match(done.out, /DeepSeek Harness: install LCU's plugin into profile web/);
+  assert.equal((await f.main('--agent', 'dsh')).code, 0);
+  assert.equal(f.registered[1].dshProfile, 'desktop');
+  const missing = await f.main('--agent', 'dsh', '--dsh-profile', 'web', '--allow-missing');
+  assert.equal(missing.code, 0, missing.err);
+  assert.deepEqual(setup.loadSetupState(f.home).pending, ['dsh']);
+  assert.equal(setup.loadSetupState(f.home).pending_context.dsh_profile, 'web');
+  // Deferring another harness without naming DSH keeps the profile saved for the pending DSH.
+  assert.equal((await f.main('--agent', 'omp', '--allow-missing')).code, 0);
+  assert.deepEqual(setup.loadSetupState(f.home).pending, ['dsh', 'omp']);
+  assert.equal(setup.loadSetupState(f.home).pending_context.dsh_profile, 'web');
+  // Retrying the pending DSH without --dsh-profile keeps it too.
+  assert.equal((await f.main('--agent', 'dsh', '--allow-missing')).code, 0);
+  assert.equal(setup.loadSetupState(f.home).pending_context.dsh_profile, 'web');
+  f.installed = new Set(['dsh']);
+  f.registered.length = 0;
+  const reconciled = await f.reconcile();
+  assert.equal(reconciled.code, 0, reconciled.err);
+  assert.deepEqual([f.registered[0].names, f.registered[0].dshProfile], [['dsh'], 'web']);
+  assert.deepEqual(setup.loadSetupState(f.home).pending, ['omp']);
+  f.failing = new Set(['dsh']);
+  assert.match((await f.main('--agent', 'dsh', '--dsh-profile', 'web')).err, /--dsh-profile web --agent dsh/);
+  writeFileSync(setup.setupStatePath(f.home), JSON.stringify({ chrome: false, audio: false, pending: ['dsh'],
+    pending_context: { scope: 'user', project: null, session: 'direct', dsh_profile: '../x' } }));
+  assert.throws(() => setup.loadSetupState(f.home), /Malformed LCU setup state/);
 });

@@ -1,5 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 
+import { plainWarning } from '../hooks/data'
+
 const APPROVAL = {
   id: 'abc',
   message: 'Allow Computer Use to use "Zed"?',
@@ -13,12 +15,15 @@ const APPROVAL = {
 const ok = (value: unknown) => ({ value: { content: [{ type: 'text', text: JSON.stringify(value) }] } })
 
 // Stand in for LCU beneath the mod: record what the mod sends, answer like the relay.
-function lcu(on: any, { approval = APPROVAL, surfaces = ['terminal'], placed = true } = {}) {
+function lcu(on: any, { approval = APPROVAL, surfaces = ['terminal'], placed = true, opened = [] as string[] } = {}) {
   const calls: { tool: string; args: any }[] = []
   on('session.surfaces', () => ({ value: surfaces }))
   on('classic.Elicitation', () => ({}))
-  on('ui.close', () => ({}))
-  on('ui.open', () => ({ value: placed ? { isPlaced: true } : { isPlaced: false, reason: 'narrow' } }))
+  on('ui.close', () => ({ value: undefined }))
+  on('ui.open', (_$: any, e: any) => {
+    opened.push(e.id)
+    return { value: placed ? { isPlaced: true } : { isPlaced: false, reason: 'narrow' } }
+  })
   // `$.mcp.call(server, tool, args)` reaches the bottom as one `mcp.call` event.
   on('mcp.call', async (_$: any, e: any) => {
     expect(e.server).toBe('lcu')
@@ -30,6 +35,18 @@ function lcu(on: any, { approval = APPROVAL, surfaces = ['terminal'], placed = t
     return ok({ ok: true })
   })
   return calls
+}
+
+// Stand in for the engine's question dialog: keep each question, answer after a person's pause.
+function asker(on: any, clock: any, answer = 'Deny') {
+  const questions: any[] = []
+  on('tool.call', { tool: 'AskUserQuestion' }, async (_$: any, e: any) => {
+    const [question] = e.questions
+    questions.push(question)
+    await clock.advance(1000)
+    return { result: { questions: e.questions, answers: { [question.question]: answer } } } as any
+  })
+  return questions
 }
 
 // Let the mod's hook run until LCU has seen the call.
@@ -82,21 +99,15 @@ test('the pane leaves out Always allow when the runtime did not offer it', async
   expect(calls.filter(call => call.tool === 'choice').map(call => call.args.choice)).toEqual(['deny'])
 })
 
-test('a pane on a narrow terminal is replaced by the question dialog, asked after the hook returned', async ($, on) => {
+test('a pane on a narrow terminal is replaced by the question dialog', async ($, on) => {
   const clock = mock.clock(on)
   const calls = lcu(on, { placed: false })
-  const questions: string[] = []
-  on('tool.call', { tool: 'AskUserQuestion' }, async (_$: any, e: any) => {
-    questions.push(JSON.stringify(e))
-    await clock.advance(1000)
-    return { value: { content: 'Deny' } } as any
-  })
-  const result: any = await $.classic.Elicitation(ELICITATION as any)
-  expect(result.block).toBeDefined()
-  expect(calls.map(call => call.tool)).toEqual(['request'])
+  const questions = asker(on, clock)
+  const pending = $.classic.Elicitation(ELICITATION as any)
   await until(clock, () => calls.some(call => call.tool === 'choice'))
+  expect(((await pending) as any).block).toBeDefined()
   expect(questions.length).toBe(1)
-  expect(calls.filter(call => call.tool === 'choice').length).toBe(1)
+  expect(calls.map(call => call.tool)).toEqual(['request', 'choice'])
 })
 
 test('an elicitation LCU does not recognize is left to the engine', async ($, on) => {
@@ -133,7 +144,7 @@ test('the model may not call the host-only tools', async ($, on) => {
 })
 
 // The host beneath the mod: processes, files, the store, the session, toasts.
-function host(on: any, { files = {} as Record<string, string>, processes = (argv: string[]): any => undefined, session = 'sess-1', terminal = 'ghostty' } = {}) {
+function host(on: any, { files = {} as Record<string, string>, processes = (argv: string[]): any => undefined, session = (): string => 'sess-1', terminal = 'ghostty' } = {}) {
   const ran: string[][] = []
   const toasts: string[] = []
   const store = new Map<string, unknown>()
@@ -150,7 +161,7 @@ function host(on: any, { files = {} as Record<string, string>, processes = (argv
       ? { value: e.as === 'bytes' ? { base64: files[key(e.path)] } : files[key(e.path)] }
       : { deny: `no such file: ${e.path}` })
   on('env.get', (_$: any, e: any) => ({ value: ({ HOME: '/home/me', TERM_PROGRAM: terminal } as Record<string, string>)[e.name] }))
-  on('session.id', () => ({ value: session }))
+  on('session.id', () => ({ value: session() }))
   on('store.get', (_$: any, e: any) => ({ value: store.get(e.key) }))
   on('store.set', (_$: any, e: any) => { store.set(e.key, e.value); return { value: undefined } })
   on('ui.toast', (_$: any, e: any) => { toasts.push(e.text); return { value: undefined } })
@@ -186,6 +197,23 @@ test('the approval shows the app icon made with sips, on a terminal and on the a
   await $.classic.Elicitation(ELICITATION as any)
   await until(clock, () => calls.filter(call => call.tool === 'request').length === 2)
   expect(ran.slice(before).filter(argv => argv[0] === '/usr/bin/sips')).toEqual([])
+})
+
+test('an app without an .icns gets its icon from the system as PNG', async ($, on) => {
+  const clock = mock.clock(on)
+  const calls = lcu(on)
+  const { ran, store } = host(on, {
+    files: { '/tmp/icons/icon.png': ZED_ICON },
+    processes: (argv: string[]) => argv[0] === '/usr/bin/plutil' ? { exitCode: 1 } : iconProcesses(argv),
+  })
+  const { ui } = await openPane($, clock, calls)
+  const drawn = ran.find(argv => argv[0] === '/usr/bin/osascript')
+  expect(drawn?.at(-1)).toContain('representationUsingTypeProperties(4,')
+  const small = ran.find(argv => argv[0] === '/usr/bin/sips') ?? []
+  expect(small.slice(0, 5)).toEqual(['/usr/bin/sips', '-s', 'format', 'png', '-Z'])
+  expect(small.slice(-3)).toEqual(['/tmp/icons/full.png', '--out', '/tmp/icons/icon.png'])
+  expect(store.get('icon:dev.zed.Zed')).toEqual({ png: ZED_ICON })
+  expect(await ui.find({ type: 'Image' })).toBeDefined()
 })
 
 test('an approval without an icon still opens; the primary, secondary and dismiss buttons keep their order', async ($, on) => {
@@ -316,7 +344,6 @@ test('the panel never offers to revoke a conversation grant', async ($, on) => {
 })
 
 test('the warning is shown without the runtime\'s product name', async () => {
-  const { plainWarning } = await import('../hooks/data')
   expect(plainWarning('Allowing ChatGPT to use this app introduces new risks. Carefully monitor ChatGPT while it uses this app. ChatGPT may err.'))
     .toBe('Allowing computer use to control this app introduces new risks. Carefully monitor the agent while it uses this app. the agent may err.')
 })
@@ -324,16 +351,90 @@ test('the warning is shown without the runtime\'s product name', async () => {
 test('the ask fallback shows the warning without the product name', async ($, on) => {
   const clock = mock.clock(on)
   const calls = lcu(on, { placed: false })
-  const questions: string[] = []
+  const questions = asker(on, clock)
+  await $.classic.Elicitation(ELICITATION as any)
+  await until(clock, () => calls.some(call => call.tool === 'choice'))
+  expect(questions[0].question).toBe(
+    '\u26a0\ufe0f High risk \u2014 Computer use will be able to see and control Zed (dev.zed.Zed). ' +
+    'Allowing computer use to control this app introduces new risks. Allow it?')
+  expect(questions[0].header).toBe('Computer use')
+  expect(questions[0].options.map((option: any) => option.label)).toEqual(['Allow this conversation', 'Always allow', 'Deny'])
+})
+
+// The desktop app flags the session only for a permission request, which the question card is.
+const DESKTOP = { approval: { ...APPROVAL, scopes: ['session'], riskLevel: 'low', warning: undefined as any }, surfaces: ['desktop'] }
+
+test('on the desktop app the question card asks, and no pane opens', async ($, on) => {
+  const clock = mock.clock(on)
+  const opened: string[] = []
+  const calls = lcu(on, { ...DESKTOP, opened })
+  const { toasts } = host(on)
+  const questions = asker(on, clock, 'Allow this conversation')
+  const result: any = await $.classic.Elicitation(ELICITATION as any)
+  expect(result.block).toBeDefined()
+  await until(clock, () => calls.some(call => call.tool === 'choice'))
+  expect(opened).toEqual([])
+  expect(questions.map(question => question.question)).toEqual([
+    'Computer use will be able to see and control Zed (dev.zed.Zed). Allow it?',
+  ])
+  expect(questions[0].options.map((option: any) => option.label)).toEqual(['Allow this conversation', 'Deny'])
+  expect(calls.filter(call => call.tool === 'choice').map(call => call.args.choice)).toEqual(['session'])
+  expect(toasts).toEqual(['Zed allowed for this conversation'])
+})
+
+test('with a terminal attached as well, the desktop app still gets the question card', async ($, on) => {
+  const clock = mock.clock(on)
+  const opened: string[] = []
+  const calls = lcu(on, { ...DESKTOP, surfaces: ['terminal', 'desktop'], opened })
+  const questions = asker(on, clock, 'Deny')
+  await $.classic.Elicitation(ELICITATION as any)
+  await until(clock, () => calls.some(call => call.tool === 'choice'))
+  expect(opened).toEqual([])
+  expect(questions.length).toBe(1)
+  expect(calls.filter(call => call.tool === 'choice').map(call => call.args.choice)).toEqual(['deny'])
+})
+
+test('a terminal alone gets the pane, not the question card', async ($, on) => {
+  const clock = mock.clock(on)
+  const opened: string[] = []
+  const calls = lcu(on, { opened })
+  const questions = asker(on, clock)
+  await $.classic.Elicitation(ELICITATION as any)
+  await until(clock, () => calls.some(call => call.tool === 'request'))
+  await clock.advance(2000)
+  expect(opened).toContain(`lcu-approval-${APPROVAL.id}`)
+  expect(questions).toEqual([])
+  expect(calls.map(call => call.tool)).toEqual(['request'])
+})
+
+test('a dismissed question card is a cancel; typed text is a deny', async ($, on) => {
+  const clock = mock.clock(on)
+  const answers = ['[User dismissed \u2014 do not proceed, wait for next instruction]', 'something else']
+  const calls = lcu(on, DESKTOP)
+  const { toasts } = host(on)
   on('tool.call', { tool: 'AskUserQuestion' }, async (_$: any, e: any) => {
-    questions.push(JSON.stringify(e))
+    const [question] = e.questions
     await clock.advance(1000)
-    return { value: { content: 'Deny' } } as any
+    return { result: { questions: e.questions, answers: { [question.question]: answers.shift() } } } as any
+  })
+  for (let n = 1; n <= 2; n++) {
+    await $.classic.Elicitation(ELICITATION as any)
+    await until(clock, () => calls.filter(call => call.tool === 'choice').length === n)
+  }
+  expect(calls.filter(call => call.tool === 'choice').map(call => call.args.choice)).toEqual(['cancel', 'deny'])
+  expect(toasts).toEqual(['Approval for Zed dismissed', 'Zed denied'])
+})
+
+test('a too-fast answer on the question card is a deny', async ($, on) => {
+  const clock = mock.clock(on)
+  const calls = lcu(on, DESKTOP)
+  on('tool.call', { tool: 'AskUserQuestion' }, async (_$: any, e: any) => {
+    const [question] = e.questions
+    return { result: { questions: e.questions, answers: { [question.question]: 'Allow this conversation' } } } as any
   })
   await $.classic.Elicitation(ELICITATION as any)
   await until(clock, () => calls.some(call => call.tool === 'choice'))
-  expect(questions[0]).toContain('Allowing computer use to control this app')
-  expect(questions[0]).not.toContain('ChatGPT')
+  expect(calls.filter(call => call.tool === 'choice').map(call => call.args.choice)).toEqual(['deny'])
 })
 
 test('not installed apps are grouped after the installed ones and stay revocable', async ($, on) => {
@@ -357,50 +458,57 @@ test('a terminal that cannot draw pictures gets no icon cell before the name', a
 
 const NOTICE = {
   current: '0.9.1', latest: '0.9.2', severity: 'normal', release_url: 'https://example.test/r', command: LCU,
-  message: 'LCU 0.9.2 is available (installed: 0.9.1). Tell the user and offer to run `lcu update`.',
+  message: 'LCU 0.9.2 is available (installed: 0.9.1). Run `lcu update`, then restart the agents that use LCU.',
 }
 
+// The test switches sessions by setting `session.id`, what `$.session.id()` answers.
 function noticeHost(on: any, processes: (argv: string[]) => any, surfaces: string[] = ['terminal'], files: Record<string, string> = { [LCU]: '' }) {
-  on('classic.SessionStart', () => ({}))
+  const session = { id: 's1' }
+  on('session.start', () => ({ cwd: '/work' }))
+  on('command.register', () => ({ value: undefined }))
   on('session.surfaces', () => ({ value: surfaces }))
-  return host(on, { files, processes })
+  return { ...host(on, { files, processes, session: () => session.id }), session }
 }
+
+const start = ($: any) => $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true } as any)
 
 const noticeRun = (stdout: string) => (argv: string[]) => (argv[1] === 'update' ? { stdout } : undefined)
 
-test('an update notice becomes session context and one toast', async ($, on) => {
+// The notice is for the person: a toast, and the hook's result unchanged, so the model never receives it.
+test('an update notice becomes one toast and never model context', async ($, on) => {
   const { ran, toasts } = noticeHost(on, noticeRun(JSON.stringify(NOTICE)))
-  const result: any = await $.classic.SessionStart({ source: 'startup' } as any)
-  expect(ran.find(argv => argv[1] === 'update')).toEqual([LCU, 'update', '--notice', '--json', '--announce'])
-  expect(result.additionalContext).toEqual([NOTICE.message])
+  const result: any = await start($)
+  expect(ran.find(argv => argv[1] === 'update')?.slice(0, 4)).toEqual([LCU, 'update', '--notice', '--json'])
+  expect(ran.find(argv => argv[1] === 'update')?.[4]).toMatch(/^--announce/)
+  expect(result).toEqual({ cwd: '/work' })
   expect(toasts).toEqual(['LCU 0.9.2 is available \u2014 ask Claude to update it, or run lcu update'])
 })
 
 test('the session id goes to lcu, which applies the account-wide cooldown', async ($, on) => {
   const { ran } = noticeHost(on, noticeRun(JSON.stringify(NOTICE)))
-  await $.classic.SessionStart({ source: 'startup', session_id: 's1' } as any)
+  await start($)
   expect(ran.find(argv => argv[1] === 'update')).toEqual([LCU, 'update', '--notice', '--json', '--announce=s1'])
 })
 
-test('a release lcu already announced on the account today: no context, no toast', async ($, on) => {
-  const { toasts } = noticeHost(on, argv => (argv[1] === 'update' ? { stdout: argv[4] === '--announce=s2' ? '{}' : JSON.stringify(NOTICE) } : undefined))
-  const first: any = await $.classic.SessionStart({ source: 'startup', session_id: 's1' } as any)
-  const second: any = await $.classic.SessionStart({ source: 'startup', session_id: 's2' } as any)
-  expect(first.additionalContext).toEqual([NOTICE.message])
-  expect(second.additionalContext).toBeUndefined()
+test('a release lcu already announced on the account today: no toast', async ($, on) => {
+  const { toasts, session } = noticeHost(on, argv => (argv[1] === 'update' ? { stdout: argv[4] === '--announce=s2' ? '{}' : JSON.stringify(NOTICE) } : undefined))
+  await start($)
+  expect(toasts.length).toBe(1)
+  session.id = 's2'
+  await start($)
   expect(toasts.length).toBe(1)
 })
 
-test('a headless run gets the context without a toast', async ($, on) => {
+test('a headless run gets neither context nor a toast', async ($, on) => {
   const { toasts } = noticeHost(on, noticeRun(JSON.stringify(NOTICE)), [])
-  const result: any = await $.classic.SessionStart({ source: 'startup' } as any)
-  expect(result.additionalContext).toEqual([NOTICE.message])
+  const result: any = await start($)
+  expect(result).toEqual({ cwd: '/work' })
   expect(toasts).toEqual([])
 })
 
 test('a security notice toast is prefixed', async ($, on) => {
   const { toasts } = noticeHost(on, noticeRun(JSON.stringify({ ...NOTICE, severity: 'security' })))
-  await $.classic.SessionStart({ source: 'startup' } as any)
+  await start($)
   expect(toasts[0].startsWith('Security update: LCU 0.9.2')).toBe(true)
 })
 
@@ -412,27 +520,27 @@ const quiet: [string, (argv: string[]) => any][] = [
   ['a command that cannot run', () => { throw new Error('no processes') }],
 ]
 for (const [name, processes] of quiet) {
-  test(`${name}: no context, no toast, no throw`, async ($, on) => {
+  test(`${name}: no toast, no throw`, async ($, on) => {
     const { toasts } = noticeHost(on, processes)
-    const result: any = await $.classic.SessionStart({ source: 'startup' } as any)
-    expect(result.additionalContext).toBeUndefined()
+    const result: any = await start($)
+    expect(result).toEqual({ cwd: '/work' })
     expect(toasts).toEqual([])
   })
 }
 
 test('without lcu installed nothing is run for the notice', async ($, on) => {
   const { ran } = noticeHost(on, noticeRun(JSON.stringify(NOTICE)), ['terminal'], {})
-  await $.classic.SessionStart({ source: 'startup' } as any)
+  await start($)
   expect(ran.some(argv => argv[1] === 'update')).toBe(false)
 })
 
 // Prompts after the session started: the first checks, later ones at most every ten minutes.
 const MIN = 60000
 function promptHost(on: any, processes: (argv: string[]) => any) {
-  on('classic.UserPromptSubmit', () => ({}))
+  on('prompt.submit', (_$: any, e: any) => ({ text: e.text }))
   return noticeHost(on, processes)
 }
-const prompt = ($: any, session_id = 's1') => $.classic.UserPromptSubmit({ prompt: 'hi', session_id } as any)
+const prompt = ($: any) => $.prompt.submit({ text: 'hi' } as any)
 const checks = (ran: string[][]) => ran.filter(argv => argv[1] === 'update').length
 const NEWER = { ...NOTICE, latest: '0.9.3', message: 'LCU 0.9.3 is available.' }
 
@@ -440,7 +548,7 @@ test('the first prompt checks for a notice', async ($, on) => {
   const { ran, toasts } = promptHost(on, noticeRun(JSON.stringify(NOTICE)))
   const result: any = await prompt($)
   expect(checks(ran)).toBe(1)
-  expect(result.additionalContext).toEqual([NOTICE.message])
+  expect(result).toEqual({ text: 'hi' })
   expect(toasts.length).toBe(1)
 })
 
@@ -458,25 +566,26 @@ test('a prompt within ten minutes of a check does not run the command', async ($
 
 test('a version announced at session start is not repeated', async ($, on) => {
   const clock = mock.clock(on)
-  const { ran } = promptHost(on, noticeRun(JSON.stringify(NOTICE)))
-  await $.classic.SessionStart({ source: 'startup', session_id: 's1' } as any)
+  const { ran, toasts } = promptHost(on, noticeRun(JSON.stringify(NOTICE)))
+  await start($)
   await clock.advance(11 * MIN)
-  const result: any = await prompt($)
+  await prompt($)
   expect(checks(ran)).toBe(2)
-  expect(result.additionalContext).toBeUndefined()
+  expect(toasts.length).toBe(1)
 })
 
 test('after the cooldown lcu announces again: a session told nothing yet gets it once', async ($, on) => {
   const clock = mock.clock(on)
   let out = '{}'
   const { toasts } = promptHost(on, argv => (argv[1] === 'update' ? { stdout: out } : undefined))
-  await $.classic.SessionStart({ source: 'startup', session_id: 's1' } as any)
+  await start($)
   out = JSON.stringify(NOTICE)
+  expect(toasts.length).toBe(0)
   await clock.advance(11 * MIN)
-  expect(((await prompt($)) as any).additionalContext).toEqual([NOTICE.message])
+  await prompt($)
   expect(toasts.length).toBe(1)
   await clock.advance(11 * MIN)
-  expect(((await prompt($)) as any).additionalContext).toBeUndefined()
+  await prompt($)
   expect(toasts.length).toBe(1)
 })
 
@@ -484,28 +593,69 @@ test('a newer version is announced once', async ($, on) => {
   const clock = mock.clock(on)
   let out = JSON.stringify(NOTICE)
   const { toasts } = promptHost(on, argv => (argv[1] === 'update' ? { stdout: out } : undefined))
-  await $.classic.SessionStart({ source: 'startup', session_id: 's1' } as any)
+  await start($)
   out = JSON.stringify(NEWER)
   await clock.advance(11 * MIN)
-  const result: any = await prompt($)
-  expect(result.additionalContext).toEqual([NEWER.message])
+  await prompt($)
   expect(toasts.length).toBe(2)
   await clock.advance(11 * MIN)
-  expect(((await prompt($)) as any).additionalContext).toBeUndefined()
+  await prompt($)
+  expect(toasts.length).toBe(2)
 })
 
 test('sessions are independent', async ($, on) => {
-  const { ran } = promptHost(on, noticeRun(JSON.stringify(NOTICE)))
-  const a: any = await prompt($, 'a')
-  const b: any = await prompt($, 'b')
+  const { ran, toasts, session } = promptHost(on, noticeRun(JSON.stringify(NOTICE)))
+  await prompt($)
+  session.id = 's2'
+  await prompt($)
   expect(checks(ran)).toBe(2)
-  expect(a.additionalContext).toEqual([NOTICE.message])
-  expect(b.additionalContext).toEqual([NOTICE.message])
+  expect(toasts.length).toBe(2)
 })
 
 test('a failing check on a prompt gives nothing and does not throw', async ($, on) => {
   const { toasts } = promptHost(on, () => { throw new Error('no processes') })
   const result: any = await prompt($)
-  expect(result.additionalContext).toBeUndefined()
+  expect(result).toEqual({ text: 'hi' })
   expect(toasts).toEqual([])
+})
+
+// A call the mod's own code makes outside its hooks (from a timer) is not seen by the mod's own tool.check,
+// so the session's permission rules decide it: auto mode's classifier refused approval_choice and the choice
+// never reached LCU. So the question is asked, and the choice recorded, within the Elicitation hook.
+async function recordedWithinHook($: any, on: any, options: any) {
+  const clock = mock.clock(on)
+  const calls = lcu(on, options)
+  asker(on, clock, 'Allow this conversation')
+  let recordedFirst: boolean | undefined
+  const pending = $.classic.Elicitation(ELICITATION as any).then((result: any) => {
+    recordedFirst = calls.some(call => call.tool === 'choice')
+    return result
+  })
+  await until(clock, () => calls.some(call => call.tool === 'choice') && recordedFirst !== undefined)
+  expect((await pending).block).toBeDefined()
+  expect(recordedFirst).toBe(true)
+  expect(calls.filter(call => call.tool === 'choice').map(call => call.args.choice)).toEqual(['session'])
+}
+
+test('the desktop question card records the choice before the Elicitation hook returns', async ($, on) => {
+  await recordedWithinHook($, on, DESKTOP)
+})
+
+test('the narrow-terminal question dialog records the choice before the Elicitation hook returns', async ($, on) => {
+  await recordedWithinHook($, on, { placed: false })
+})
+
+// Claude Code 2.1.304 in the Claude app: no surface attached yet when the approval arrives. The entrypoint
+// says it is the app, whose own answer to the engine's form is a decline, so the question card asks.
+test('in the Claude app with no surface attached the question card still asks', async ($, on) => {
+  const clock = mock.clock(on)
+  const opened: string[] = []
+  const calls = lcu(on, { ...DESKTOP, surfaces: [], placed: false, opened })
+  on('env.get', (_$: any, e: any) => ({ value: e.name === 'CLAUDE_CODE_ENTRYPOINT' ? 'claude-desktop' : undefined }))
+  const questions = asker(on, clock, 'Allow this conversation')
+  const pending = $.classic.Elicitation(ELICITATION as any)
+  await until(clock, () => calls.some(call => call.tool === 'choice'))
+  expect(((await pending) as any).block).toBeDefined()
+  expect(questions.length).toBe(1)
+  expect(calls.filter(call => call.tool === 'choice').map(call => call.args.choice)).toEqual(['session'])
 })

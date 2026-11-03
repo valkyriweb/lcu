@@ -44,6 +44,7 @@ class BuildPlatformTests(unittest.TestCase):
                 (release / 'adapters/audio-files.mjs').write_text('fixture')
                 (release / 'adapters/codex.mjs').write_text('fixture')
                 (release / 'adapters/host-guard.mjs').write_text('fixture')
+                (release / 'adapters/cross-turn.mjs').write_text('fixture')
                 (release / 'adapters/diagnostics.mjs').write_text('fixture')
                 (release / 'adapters/pi/index.ts').write_text('fixture')
             with mock.patch.object(build_bundle, 'architecture', return_value='arm64'), \
@@ -64,6 +65,8 @@ class BuildPlatformTests(unittest.TestCase):
                 self.assertNotIn(prefix + 'scripts/install_windows.mjs', names)
                 self.assertFalse(any(name.startswith(prefix + 'lcu/') and name.endswith('.py') for name in names))
                 self.assertIn(prefix + 'lcu/platforms.mjs', names)
+                self.assertIn(prefix + 'lcu/claude_hook.mjs', names)
+                self.assertIn(prefix + 'lcu/claude_lifecycle.mjs', names)
                 self.assertIn(prefix + 'lcu/macos_host.mjs', names)
                 self.assertIn(prefix + 'lcu/macos_sky_service.mjs', names)
                 self.assertNotIn(prefix + 'lcu/linux_sky_service.mjs', names)
@@ -82,6 +85,7 @@ class BuildPlatformTests(unittest.TestCase):
                 self.assertIn(prefix + 'adapters/audio-files.mjs', names)
                 self.assertIn(prefix + 'adapters/codex.mjs', names)
                 self.assertIn(prefix + 'adapters/host-guard.mjs', names)
+                self.assertIn(prefix + 'adapters/cross-turn.mjs', names)
                 self.assertIn(prefix + 'adapters/diagnostics.mjs', names)
                 self.assertNotIn(prefix + 'app/Contents/Resources/cua_node/bin/node', names)
                 manifest = json.load(bundle.extractfile(prefix + 'bundle.json'))
@@ -193,6 +197,7 @@ class BuildPlatformTests(unittest.TestCase):
             self.assertTrue((release / 'adapters/audio-files.mjs').is_file())
             self.assertTrue((release / 'adapters/codex.mjs').is_file())
             self.assertTrue((release / 'adapters/pi/index.ts').is_file())
+            self.assertEqual([path.name for path in (release / 'adapters/dsh').iterdir()], ['plugin.mjs'])
             mod = release / 'adapters/claude-mod/lcu-approve'
             for name in ('.claude-plugin/plugin.json', 'hooks/hooks.json', 'hooks/register.tsx'):
                 self.assertTrue((mod / name).is_file(), name)

@@ -31,11 +31,11 @@ claude plugin install lcu@lcu
 
 - **Desktop apps:** read windows, click, type, and take screenshots.
 - **Chrome, when enabled:** read and control tabs through the official extension, with site approval.
-- **In your harness:** adapters are available for Pi, Codex CLI, and Claude Code, with experimental Oh My Pi and Hermes integrations. See [setup and verification limits](docs/ADAPTERS.md).
+- **In your harness:** adapters are available for Pi, Codex CLI, and Claude Code, with experimental Oh My Pi, Hermes, DeepSeek Harness and Junie integrations. With Junie, app approvals are permanent until revoked: Junie cannot show LCU's per-app prompt, so it runs `lcu apps allow <App>` itself and each approval lasts until `lcu apps revoke <App>`. See [setup and verification limits](docs/ADAPTERS.md).
 
 ## Approve apps from Claude, natively
 
-The first time an agent controls an app (Zed, Notes, Safari), the computer-use runtime asks you to allow it. The Claude app's Code tab used to fail that request with "Computer Use was not approved". `lcu setup --agent claude-code` now installs a small Claude Code mod, `lcu-approve`, that shows the question as a native **Computer use approval** pane in the Claude app, and in the terminal.
+The first time an agent controls an app (Zed, Notes, Safari), the computer-use runtime asks you to allow it. The Claude app's Code tab used to fail that request with "Computer Use was not approved". `lcu setup --agent claude-code` now installs a small Claude Code mod, `lcu-approve`, that asks the question natively: as a question card in the Claude app, which flags the session as needing input, and as a **Computer use approval** pane in the terminal.
 
 <p align="center"><img src="docs/assets/approval-demo.gif" width="720" alt="The Computer use approval pane in Claude Code: Allow this conversation, a high-risk app with its warning, and the Approved apps panel"></p>
 
@@ -67,6 +67,23 @@ lcu apps revoke Zed      # take it back
 - Browsers, password managers and other high-risk apps come with a warning; apps Computer Use refuses outright (Terminal, iTerm2) are declined.
 
 [Details](docs/INSTALLATION.md#manage-approved-apps).
+
+## Keep Computer Use across turns (Claude Code)
+
+In Claude Code, Computer Use normally ends with the turn that started it. A background subagent still working after that turn ended, or a turn that reuses an ended turn id, is told "Computer Use is unavailable because the current turn ended." An opt-in setting keeps it available for every turn of the session:
+
+```sh
+lcu cross-turn           # status
+lcu cross-turn on        # Touch ID (or your password) on macOS
+lcu cross-turn off       # no prompt
+```
+
+- Off by default. `lcu setup --cross-turn on|off` sets it too; interactive setup asks once.
+- It affects only the Claude Code relay; Codex, Pi, Oh My Pi and Hermes ignore it. Per-app approvals (macOS and Windows) and your harness's tool approvals still apply.
+- A foreground subagent finishing no longer ends the parent's Computer Use, with the setting on or off.
+- A guard against accidents, not a security boundary: anything running as your account can edit the file or pass `--unattended` (for disposable sandbox machines, where nobody can answer the prompt).
+
+[Details](docs/INSTALLATION.md#cross-turn-computer-use).
 
 ## Permissions
 

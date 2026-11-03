@@ -14,7 +14,6 @@ const SERVER = 'lcu'
 const REQUEST_TOOL = 'approval_request'
 const CHOICE_TOOL = 'approval_choice'
 const ASK_HEADER = 'Computer use'
-const WARNING_TITLE = 'Elevated risk'
 const APPROVAL_TITLE = 'Computer use approval'
 const APPS_COMMAND = 'computer-use-apps'
 const APPS_PANE = 'lcu-approved-apps'
@@ -31,7 +30,7 @@ type McpResult = { isError?: boolean; content?: { type: string; text?: string }[
 const textOf = (result: McpResult) =>
   (result.content ?? []).map(item => item.text ?? '').join('')
 
-// Update notices: per session (the classic event's session_id), what was last announced and when the cache
+// Update notices: per session (`$.session.id()`), what was last announced and when the cache
 // was last asked. Whether to announce at all is `lcu update --notice --announce`'s decision (once per session
 // and release, at most once a day per release across the account), so the toast follows it.
 const NOTICE_RECHECK_MS = 600000
@@ -45,7 +44,11 @@ export const register: Register = on => {
     if (e.mcp_server_name !== SERVER) return next(e)
     // Nobody to ask in a headless run: the engine answers for itself. The desktop app can report no
     // surfaces while it still places panes, so an empty list alone does not mean headless.
-    if ((await $.session.surfaces()).length === 0 && !(await placesPanes($))) return next(e)
+    const surfaces = await $.session.surfaces()
+    // The Claude app starts Claude Code with this entrypoint; with 2.1.304 its session can have no surface
+    // attached yet when the approval arrives, and its own answer to the engine's form is a decline.
+    const inApp = (await $.env.get('CLAUDE_CODE_ENTRYPOINT').catch(() => undefined)) === 'claude-desktop'
+    if (surfaces.length === 0 && !inApp && !(await placesPanes($))) return next(e)
 
     let approval: Approval
     try {
@@ -57,6 +60,16 @@ export const register: Register = on => {
       return next(e)
     }
 
+    // The desktop app flags a session as needing input only for a permission request: the engine's
+    // question card is one, a pane is not. So the app gets the card, even with a terminal attached too.
+    // Asked and recorded within this hook: approval_choice sent from a timer would be the mod's own code
+    // outside its hooks, which its tool.check never sees, so the session's permission rules would decide it
+    // (auto mode's classifier refuses it). Waiting on `$` does not spend the hook's budget.
+    if (surfaces.includes('desktop') || (inApp && !surfaces.includes('terminal'))) {
+      await askAndRecord($, approval)
+      return { block: 'Answered by the lcu-approve mod' }
+    }
+
     // The icon is made here, in an event hook: a render closure cannot run a process.
     const icon = await appIcon($, approval.app).catch(() => undefined)
     const graphics = await terminalDrawsImages($)
@@ -65,8 +78,8 @@ export const register: Register = on => {
     // delivering the pane's presses. The pane's button (or Esc) records the choice with LCU, whose
     // relay keeps the runtime's elicitation open until then; this hook only blocks the engine's form.
     if (!(await showPane($, approval, icon, graphics))) {
-      // A narrow terminal seats no pane: ask from a timer, which is a dispatch of its own.
-      $.clock.after(0, () => askAndRecord($, approval))
+      // A narrow terminal seats no pane: the question dialog asks, within this hook as on the desktop.
+      await askAndRecord($, approval)
     }
     return { block: 'Answered by the lcu-approve mod' }
   })
@@ -124,47 +137,50 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // The update notices hook native events: in Team and Enterprise organizations Claude Code's sec-default guard
+  // skips the classic hooks of mods a person installs.
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: APPS_COMMAND,
       description: 'Show the apps Computer use may control, and allow or revoke them',
     })
-    return next(e)
-  })
-
-  // An update notice from the cache `lcu update --notice` keeps: the model gets the message as session
-  // context (`session.start` cannot carry any; the classic SessionStart hook can), the person one toast.
-  on('classic.SessionStart', async ($, e, next) => {
     const result = await next(e)
-    const state = sessionState(e)
-    state.lastCheck = await now($)
-    const notice = await updateNotice($, sessionId(e))
-    if (!notice) return result
-    state.announced = notice.latest ?? notice.message
-    await toast($, notice)
-    return { ...result, additionalContext: [...(result.additionalContext ?? []), notice.message] }
+    // An update notice from the cache `lcu update --notice` keeps: the person gets one toast. The model never
+    // receives it; the hook's result is returned unchanged.
+    try {
+      const session = await sessionId($)
+      const state = sessionState(session)
+      state.lastCheck = await now($)
+      const notice = await updateNotice($, session)
+      if (!notice) return result
+      state.announced = notice.latest ?? notice.message
+      await toast($, notice)
+      return result
+    } catch {
+      return result
+    }
   })
 
   // A release published while the session is open: the cache refreshes in the background, so the first
   // prompt and then at most one check per NOTICE_RECHECK_MS reads it; each version is announced once per
-  // session, and once a day across the account.
-  on('classic.UserPromptSubmit', async ($, e, next) => {
-    const result = await next(e)
+  // session, and once a day across the account. The check runs before the prompt enters, so no hook of the mod
+  // is still in flight once the turn has started (the Claude app delivers a pane's presses only then).
+  on('prompt.submit', async ($, e, next) => {
     try {
-      const state = sessionState(e)
+      const session = await sessionId($)
+      const state = sessionState(session)
       const at = await now($)
-      if (state.lastCheck !== undefined && at - state.lastCheck < NOTICE_RECHECK_MS) return result
-      state.lastCheck = at
-      const notice = await updateNotice($, sessionId(e))
-      if (!notice) return result
-      const version = notice.latest ?? notice.message
-      if (version === state.announced) return result
-      state.announced = version
-      await toast($, notice)
-      return { ...result, additionalContext: [...(result.additionalContext ?? []), notice.message] }
-    } catch {
-      return result
-    }
+      if (state.lastCheck === undefined || at - state.lastCheck >= NOTICE_RECHECK_MS) {
+        state.lastCheck = at
+        const notice = await updateNotice($, session)
+        const version = notice && (notice.latest ?? notice.message)
+        if (notice && version !== state.announced) {
+          state.announced = version
+          await toast($, notice)
+        }
+      }
+    } catch {}
+    return next(e)
   })
 
   on('command.run', { command: APPS_COMMAND }, async $ => {
@@ -199,11 +215,13 @@ const now = async ($: any): Promise<number> => {
   }
 }
 
-const sessionId = (e: any): string | undefined =>
-  typeof e?.session_id === 'string' && e.session_id ? e.session_id : undefined
+const sessionId = async ($: any): Promise<string | undefined> => {
+  const id = await $.session.id().catch(() => undefined)
+  return typeof id === 'string' && id ? id : undefined
+}
 
-const sessionState = (e: any) => {
-  const id = sessionId(e) ?? DEFAULT_SESSION
+const sessionState = (session: string | undefined) => {
+  const id = session ?? DEFAULT_SESSION
   let state = noticeSessions.get(id)
   if (!state) noticeSessions.set(id, (state = {}))
   return state
@@ -330,12 +348,13 @@ async function convertIcon($: any, bundleId: string): Promise<string | undefined
     }
     if (!source) {
       // Asset-catalog icons have no .icns: ask the system for the icon.
+      // JXA does not bridge NSBitmapImageFileTypePNG, so pass its value (4); the name gives TIFF.
       const script = 'ObjC.import("AppKit");var i=$.NSWorkspace.sharedWorkspace.iconForFile(' + JSON.stringify(app) +
         ');var r=$.NSBitmapImageRep.imageRepWithData(i.TIFFRepresentation);' +
-        'r.representationUsingTypeProperties($.NSBitmapImageRepFileTypePNG,$({})).writeToFileAtomically(' + JSON.stringify(`${dir}/full.png`) + ',true)'
+        'r.representationUsingTypeProperties(4,$({})).writeToFileAtomically(' + JSON.stringify(`${dir}/full.png`) + ',true)'
       const drawn = await $.process.run(['/usr/bin/osascript', '-l', 'JavaScript', '-e', script], { timeoutMs: 3000 })
       if (!ok(drawn)) return undefined
-      const small = await $.process.run(['/usr/bin/sips', '-Z', ICON_PIXELS, `${dir}/full.png`, '--out', out], { timeoutMs: 3000 })
+      const small = await $.process.run(['/usr/bin/sips', '-s', 'format', 'png', '-Z', ICON_PIXELS, `${dir}/full.png`, '--out', out], { timeoutMs: 3000 })
       if (!ok(small)) return undefined
     }
     const { base64 } = await $.fs.read(out, { as: 'bytes' })
@@ -487,20 +506,32 @@ async function showPane($: any, approval: Approval, icon: string | undefined, gr
   return false
 }
 
-// The engine's question dialog, for where no pane is seated.
+// What a dismissed card (its close mark, or Skip) resolves the question with.
+const DISMISSED = '[User dismissed'
+
+// The question: the app, the risk when high. The desktop app draws only this text and the option labels.
+function askQuestion(approval: Approval): string {
+  const sentence = `Computer use will be able to see and control ${approval.label} (${approval.app}).`
+  if (approval.riskLevel !== 'high') return `${sentence} Allow it?`
+  const warning = approval.warning ? ` ${plainWarning(approval.warning)}` : ''
+  return `\u26a0\ufe0f High risk \u2014 ${sentence}${warning} Allow it?`
+}
+
+// The engine's question dialog: the desktop app's card, and a terminal where no pane is seated.
 async function askAndRecord($: any, approval: Approval): Promise<void> {
   const options = [LABEL_SESSION, ...(approval.scopes.includes('always') ? [LABEL_ALWAYS] : []), LABEL_DENY]
-  const risk = approval.riskLevel === 'high' && approval.warning ? `\n${WARNING_TITLE}: ${plainWarning(approval.warning)}` : ''
-  const question = `Computer use will be able to see and control ${approval.label} (${approval.app}).${risk}`
-  const started = Date.now()
+  const started = await now($)
   let choice: Choice = 'cancel'
   try {
-    const answer: string = await $.ui.ask(question, { options, header: ASK_HEADER })
-    choice = 'deny'
-    // A person cannot answer in under a few hundred milliseconds; anything faster was not a person.
-    if (Date.now() - started >= 400) {
-      if (answer === LABEL_SESSION) choice = 'session'
-      else if (answer === LABEL_ALWAYS && options.includes(LABEL_ALWAYS)) choice = 'always'
+    const answer: string = await $.ui.ask(askQuestion(approval), { options, header: ASK_HEADER })
+    // A dismissed card resolves with a note instead of rejecting: a cancel, as Esc on the pane.
+    if (!String(answer).startsWith(DISMISSED)) {
+      choice = 'deny'
+      // A person cannot answer in under a few hundred milliseconds; anything faster was not a person.
+      if ((await now($)) - started >= 400) {
+        if (answer === LABEL_SESSION) choice = 'session'
+        else if (answer === LABEL_ALWAYS && options.includes(LABEL_ALWAYS)) choice = 'always'
+      }
     }
   } catch {
     // Dismissed.

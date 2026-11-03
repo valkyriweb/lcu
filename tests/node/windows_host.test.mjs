@@ -37,6 +37,30 @@ const SPLIT_MEMBERS = {
   'unreached-h.js': 'require("electron");module.exports={value:1};',
   'logger-h.js': 'module.exports={ok:"logger"};',
 };
+// A webpack build: the host is one function inside the module that also starts the app. The runtime
+// and every module are hand-written stand-ins for the shape webpack emits.
+const WEBPACK_ENTRY = `${LOCATION}early-bootstrap.js`;
+const runtime = (table, startup = 'var o=r(99);module.exports=o') => `(()=>{var a={${table}},i={},l={0:1};
+function r(e){var t=i[e];if(void 0!==t)return t.exports;var n=i[e]={exports:{}};return a[e].call(n.exports,n,n.exports,r),n.exports}
+r.m=a,r.d=(e,t)=>{for(var n in t)r.o(t,n)&&!r.o(e,n)&&Object.defineProperty(e,n,{enumerable:!0,get:t[n]})},r.f={},
+r.e=e=>Promise.all(Object.keys(r.f).reduce((t,n)=>(r.f[n](e,t),t),[])),r.u=e=>"early-bootstrap-"+e+"-h.js",
+r.o=(e,t)=>Object.prototype.hasOwnProperty.call(e,t),r.f.require=(e,t)=>{if(!l[e]){var n=require("./"+r.u(e));
+for(var s in n.modules)r.m[s]=n.modules[s];n.ids.forEach(e=>{l[e]=1})}};${startup}})();
+//# sourceMappingURL=early-bootstrap.js.map`;
+const ENTRY_TABLE = '10(e){"use strict";e.exports=require("node:path")},20(e){e.exports=require("electron")},' +
+  '99(e,t,r){throw Error("the app must not start")}';
+const webpackHost = (imports = 'var p=r(10),d=r(40);', body = 'return {pipePath:e,closeActiveTurn:async()=>false,dispose:async()=>{},probe:p.basename("x/y.txt")+d.a+LIMIT}') =>
+  `exports.ids=[1],exports.modules={500(e,t,r){"use strict";r.d(t,{run:()=>boot});${imports}const LIMIT=3;` +
+  `function boot(){return r(20).app.whenReady()}` +
+  `async function Kne({codexCliPath:g,nativePipeDirectory:e,windowsHelperPath:i,windowsHelperTransportModulePath:a}){${body}}}};`;
+const webpackMembers = (host = webpackHost(), extra = {}) => ({
+  'package.json': JSON.stringify({ main: WEBPACK_ENTRY }), [WEBPACK_ENTRY]: runtime(ENTRY_TABLE),
+  [`${LOCATION}early-bootstrap-1-h.js`]: host,
+  [`${LOCATION}early-bootstrap-2-h.js`]: '"use strict";exports.ids=[2],exports.modules={40:(e,t,r)=>{e.exports={a:r(41).a}},41(e){e.exports=require("dep-package")}};',
+  [`${LOCATION}worker-2-h.js`]: 'exports.ids=[2],exports.modules={40(e){throw Error("a worker chunk must not load")}};',
+  'node_modules/dep-package/package.json': '{"main":"lib/main.js"}', 'node_modules/dep-package/lib/main.js': 'module.exports={a:require("./inner").a};',
+  'node_modules/dep-package/lib/inner.js': 'module.exports={a:":package:"};', ...extra });
+
 const factory = (body, prelude = '') => `${prelude}\nfunction Kne(${OPTIONS}){${body};return {closeActiveTurn(){},nativePipeDirectory}}\n`;
 
 function fixture(t) {
@@ -135,6 +159,10 @@ test('initialisation statements travel with what they initialise; unrelated ones
   f.layoutError(f.members(factory('const u=state.value', `${prelude}state.unused=require("electron");`)), /depends on Electron/);
   const sequence = f.plan(f.members(factory('const u=state.value', 'const state={},tally={n:0};state.value=41,state.value++,tally.n+=2;'))).module;
   assert.ok(sequence.includes('state.value=41,state.value++,tally.n+=2;') && sequence.includes('const tally={n:0};'));
+  // The bundler folds a side-effect import into a module binding's interop statement.
+  const interop = f.plan(f.members(factory('const u=net', 'const e=require("./rolldown-runtime-h.js");let net=require("node:net");' +
+    'net=e.a(net),require("node:http");'), SPLIT_MEMBERS));
+  assert.ok(interop.module.includes('net=e.a(net),require("node:http");'));
   for (const [source, expected] of [['const state={};state.value=41,register(state);function register(){}', 'register(state);'],
     ['const state={};delete state.value;', 'delete state.value;'], ['const state={};[state.value]=[1];', '[state.value]=[1];']]) {
     assert.ok(f.plan(f.members(factory('const u=state', source))).module.includes(expected), source);
@@ -211,7 +239,7 @@ test('the plan is read-only and needs no repository hash; the factory must be un
   assert.equal(planOriginalHost(f.app, { node: NODE }).module, plan.module);
   for (const source of [`function Kne({codexCliPath,nativePipeDirectory,windowsHelperPath}){return {closeActiveTurn(){}}}`,
     `const Kne=(${OPTIONS})=>1;`, `if(1){function Kne(${OPTIONS}){return {closeActiveTurn(){}}}}`, `const decoy="function Wre(${OPTIONS}){}";`]) {
-    f.layoutError(f.members(source), /no main bundle has a top-level native-pipe host factory/);
+    f.layoutError(f.members(source), /no bundle in .vite\/build has a native-pipe host factory/);
   }
   const one = `function A(${OPTIONS}){return {closeActiveTurn(){},nativePipeDirectory}}\n`;
   const two = `async function B(${OPTIONS}){return {closeActiveTurn(){},nativePipeDirectory}}\n`;
@@ -304,6 +332,112 @@ test('the private lifetime transport forwards IDs and survives a disconnect', as
   assert.deepEqual(await send('new'), { closed: false });
   child.stdin.end();
   assert.equal(await new Promise((resolve) => child.once('exit', resolve)), 0);
+});
+
+test('a webpack build runs the host from its own module without starting the app', (t) => {
+  const f = fixture(t);
+  const members = webpackMembers();
+  const plan = f.plan(members);
+  assert.equal(plan.main, `${LOCATION}early-bootstrap-1-h.js`);
+  assert.equal(plan.factory, 'Kne');
+  assert.ok(!plan.module.includes('whenReady'));
+  const entry = f.extract(members);
+  const derived = join(entry, '..');
+  assert.equal(f.runFactory(entry).probe, 'y.txt:package:3');
+  for (const name of [`${LOCATION}early-bootstrap-1-h.js`, `${LOCATION}early-bootstrap-2-h.js`, 'node_modules/dep-package/lib/inner.js']) {
+    assert.equal(readFileSync(join(derived, name), 'utf8'), members[name]);
+  }
+  assert.equal(existsSync(join(derived, WEBPACK_ENTRY)), false);
+  assert.equal(existsSync(join(derived, `${LOCATION}worker-2-h.js`)), false);
+  const derivedRuntime = readFileSync(join(derived, `${LOCATION}lcu-webpack-runtime.cjs`), 'utf8');
+  assert.equal(derivedRuntime, members[WEBPACK_ENTRY].replace('var o=r(99);module.exports=o', 'r.e(1);r.e(2);module.exports=r;'));
+});
+
+test('the factory is found by its content under any bundle name', (t) => {
+  const f = fixture(t);
+  const members = { [`${LOCATION}preload.js`]: 'not parsed {{{', [`${LOCATION}anything-h.js`]: `function Zed(${OPTIONS}) { return {closeActiveTurn(){},nativePipeDirectory}; }` };
+  assert.equal(f.plan(members).main, `${LOCATION}anything-h.js`);
+  assert.equal(f.plan(members).factory, 'Zed');
+});
+
+test('a webpack build the host could not run from stops the install', (t) => {
+  const f = fixture(t);
+  const members = (host, extra) => Object.fromEntries(Object.entries(webpackMembers(host, extra)).filter(([, value]) => value !== null));
+  const electronEagerly = webpackHost('var p=r(10),d=r(40),x=r(20);', 'return {closeActiveTurn(){},nativePipeDirectory:x}');
+  const electronLazily = webpackHost('var p=r(10);', 'return {closeActiveTurn(){},nativePipeDirectory:()=>r(20)}');
+  f.layoutError(members(electronEagerly), /depends on Electron through webpack module 20/);
+  f.layoutError(members(electronLazily), /depends on Electron through webpack module 20/);
+  f.layoutError(members(webpackHost('var p=r(10),d=r(77);')), /needs webpack module 77, which no chunk provides/);
+  f.layoutError(members(webpackHost('var p=r(10),d=r(40);', 'return {closeActiveTurn(){},nativePipeDirectory:t}')), /unresolved identifiers: t/);
+  f.layoutError(members(undefined, { [WEBPACK_ENTRY]: runtime(ENTRY_TABLE, 'r(99)') }), /expected runtime shape/);
+  f.layoutError(members(undefined, { [WEBPACK_ENTRY]: runtime(ENTRY_TABLE).replace('r.f.require=', 'r.f.other=') }), /no synchronous chunk loader/);
+  f.layoutError(members(undefined, { [`${LOCATION}early-bootstrap-3-h.js`]: 'module.exports={};' }), /early-bootstrap-3-h\.js is not a webpack chunk/);
+  f.layoutError(members(undefined, { 'node_modules/dep-package/package.json': null }), /package dependency "dep-package" is missing or cannot run from a copy/);
+  f.layoutError(members(undefined, { 'package.json': '{"main":".vite/build/gone.js"}' }), /webpack entry ".vite\/build\/gone.js" is missing/);
+  f.layoutError(members(undefined, { [`${LOCATION}early-bootstrap-3-h.js`]: webpackHost().replaceAll('[1]', '[3]').replace('500(', '501(') }),
+    /more than one top-level native-pipe host factory/);
+});
+
+test('a function that runs while a module loads counts as loading', (t) => {
+  for (const load of ['(()=>require("dep-package"))()', '(function(){return require("dep-package")}).call(this)']) {
+    const f = fixture(t);
+    const chunk = `exports.ids=[2],exports.modules={40(e,t,r){e.exports=${load}}};`;
+    const extra = { [`${LOCATION}early-bootstrap-2-h.js`]: chunk };
+    assert.equal(f.runFactory(f.extract(webpackMembers(undefined, extra))).probe, 'y.txt:package:3');
+    f.layoutError(webpackMembers(undefined, { ...extra, 'node_modules/dep-package/native.node': 'x' }), /package dependency "dep-package" is missing or cannot run from a copy/);
+  }
+  const f = fixture(t);
+  f.layoutError(webpackMembers(undefined, { [`${LOCATION}early-bootstrap-2-h.js`]: 'exports.ids=[2],exports.modules={40(e,t,r){e.exports=(()=>r(41))()}};' }),
+    /needs webpack module 41, which no chunk provides/);
+});
+
+test('a package a named function loads is still copied', (t) => {
+  const f = fixture(t);
+  const chunk = 'exports.ids=[2],exports.modules={40(e){function load(){return require("dep-package")}e.exports=load()}};';
+  const entry = f.extract(webpackMembers(undefined, { [`${LOCATION}early-bootstrap-2-h.js`]: chunk }));
+  assert.equal(f.runFactory(entry).probe, 'y.txt:package:3');
+});
+
+test('Node resolves a copied package itself', (t) => {
+  const manifests = [{ main: 'legacy.js', exports: './lib/main.js' }, { main: 'legacy.js', exports: { '.': './lib/main.js', './other': './legacy.js' } },
+    { exports: { import: './esm.mjs', node: { import: './esm.mjs', require: './lib/main.js' }, default: './legacy.js' } }];
+  for (const manifest of manifests) {
+    const f = fixture(t);
+    const entry = f.extract(webpackMembers(undefined, { 'node_modules/dep-package/package.json': JSON.stringify(manifest),
+      'node_modules/dep-package/legacy.js': 'throw Error("Node would not load this");' }));
+    assert.equal(f.runFactory(entry).probe, 'y.txt:package:3', JSON.stringify(manifest));
+  }
+});
+
+test('a package that cannot run from a copy stops the install only when it must load', (t) => {
+  const f = fixture(t);
+  const members = (extra) => Object.fromEntries(Object.entries(webpackMembers(undefined, extra)).filter(([, value]) => value !== null));
+  const refused = /package dependency "dep-package" is missing or cannot run from a copy/;
+  f.layoutError(members({ 'node_modules/dep-package/package.json': null }), refused);
+  f.layoutError(members({ 'node_modules/dep-package/native.node': 'x' }), refused);
+});
+
+test('a host that does not load stops the install and leaves nothing behind', (t) => {
+  const f = fixture(t);
+  f.layoutError(webpackMembers(undefined, { 'node_modules/dep-package/lib/inner.js': 'module.exports=require("undeclared-peer");' }),
+    /extracted native-pipe host failed to load \(Error: Cannot find module 'undeclared-peer'/);
+  f.layoutError(webpackMembers(undefined, { 'node_modules/dep-package/lib/inner.js': 'module.exports=require("electron");' }),
+    /extracted native-pipe host failed to load \(Error: blocked electron/);
+});
+
+test('a package that declares another package is not copied', (t) => {
+  const f = fixture(t);
+  const refused = /package dependency "dep-package" is missing or cannot run from a copy/;
+  for (const field of ['dependencies', 'peerDependencies', 'optionalDependencies']) {
+    f.layoutError(webpackMembers(undefined, { 'node_modules/dep-package/package.json': JSON.stringify({ [field]: { other: '1' } }) }), refused);
+  }
+});
+
+test('a lazily used package the Electron app alone has does not stop the install', (t) => {
+  const f = fixture(t);
+  const host = webpackHost('var p=r(10),d=r(40);', 'return {pipePath:e,closeActiveTurn:async()=>false,dispose:async()=>{},probe:(()=>{try{return r(45)}catch{return "guarded"}})()}');
+  const entry = f.extract(webpackMembers(host, { [`${LOCATION}early-bootstrap-3-h.js`]: 'exports.ids=[3],exports.modules={45(e){e.exports=require("native-only")}};' }));
+  assert.equal(f.runFactory(entry).probe, 'guarded');
 });
 
 test('the Sky wrapper registers once and forwards the original service', (t) => {

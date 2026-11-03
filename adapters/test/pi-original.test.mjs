@@ -31,7 +31,9 @@ test('installed Pi de-duplicates user and project LCU packages and uses project 
     mkdirSync(join(project, '.pi'));
     // A repository file cannot replace the account-owned command selection.
     writeFileSync(join(project, '.pi/lcu-command.json'), '["/invalid/repository/command"]\n');
-    writeFileSync(installedExtension, `import lcu from ${JSON.stringify(pathToFileURL(extension).href)};\n` +
+    // The same specifier setup writes: a plain path on POSIX, a file:// URL on win32.
+    const specifier = process.platform === 'win32' ? pathToFileURL(extension).href : extension;
+    writeFileSync(installedExtension, `import lcu from ${JSON.stringify(specifier)};\n` +
       'import {readFileSync, realpathSync} from "node:fs";\n' +
       `const config = JSON.parse(readFileSync(${JSON.stringify(join(packageDir, 'commands.json'))}, "utf8"));\n` +
       'export default pi => lcu(pi, {command: config.projects?.[realpathSync(process.cwd())] ?? config.user});\n');

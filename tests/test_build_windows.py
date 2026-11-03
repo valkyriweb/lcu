@@ -1,9 +1,12 @@
 """The Windows archive is thin and platform specific."""
 
+import errno
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 from zipfile import ZipFile
@@ -36,6 +39,7 @@ class WindowsBuildTests(unittest.TestCase):
                 for name in ('bin/lcu.cmd', 'lcu/windows.mjs', 'lcu/windows_host.mjs', 'lcu/runtime.mjs',
                              'scripts/install.ps1', 'scripts/install_windows.mjs', 'scripts/install_windows.py',
                              'scripts/bundle.mjs', 'lcu/windows_host_analyze.cjs', 'lcu/vendor/acorn/acorn.js',
+                             'lcu/claude_hook.mjs', 'lcu/claude_lifecycle.mjs',
                              'lcu/vendor/acorn/LICENSE',
                              'scripts/windows_launcher.mjs', 'bundle.json',
                              'docs/verification/codex-interactive-2026-09-24.md'):
@@ -56,6 +60,46 @@ class WindowsBuildTests(unittest.TestCase):
                 for path in ('bin/lcu', 'bin/lcu-session', 'bin/lcu-codex-sandbox', 'lcu/session.mjs', 'lcu/x11.mjs', 'lcu/macos_host.mjs',
                              'scripts/install.sh', 'scripts/install.py', 'scripts/install.mjs', 'scripts/bundle.py'):
                     self.assertNotIn(prefix + path, names)
+
+    def test_a_held_temporary_file_does_not_fail_the_build_or_reach_the_archive(self):
+        # Antivirus can hold a file for a moment after npm exits; Windows then refuses the directory (WinError 145).
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tool = root / 'tool'
+            tool.write_text('fixture')
+            tool.chmod(0o755)
+            npm = root / 'node_modules/npm/bin/npm-cli.js'
+            npm.parent.mkdir(parents=True)
+            npm.write_text('fixture')
+            real_rmdir = os.rmdir
+            held = set()
+
+            def rmdir(path, *args, **options):
+                name = Path(path).name
+                if name.startswith(('lcu-build-', '.agent-tools-')):
+                    held.add(name.rsplit('-', 1)[0])
+                    raise OSError(errno.ENOTEMPTY, 'directory not empty', path)
+                return real_rmdir(path, *args, **options)
+
+            def fake_run(command, **options):
+                if 'ci' in command:
+                    directory = options['cwd']
+                    for package, version in json.loads((directory / 'package.json').read_text())['dependencies'].items():
+                        (directory / 'node_modules' / package).mkdir(parents=True)
+                        (directory / 'node_modules' / package / 'package.json').write_text(
+                            json.dumps({'version': version}))
+                return SimpleNamespace(returncode=0)
+
+            with mock.patch('os.rmdir', rmdir), \
+                    mock.patch('tempfile.tempdir', str(root)), \
+                    mock.patch('shutil.which', return_value=str(tool)), \
+                    mock.patch('subprocess.run', side_effect=fake_run), \
+                    mock.patch('provision_agent_tools.download', side_effect=AssertionError('unexpected download')):
+                archive = build_bundle.build(root / 'dist', target='windows')
+            self.assertEqual(held, {'lcu-build', '.agent-tools'})
+            self.assertTrue(archive.with_suffix('.zip.sha256').is_file())
+            with ZipFile(archive) as bundle:
+                self.assertFalse(any('.agent-tools-' in name for name in bundle.namelist()))
 
 
 if __name__ == '__main__':
