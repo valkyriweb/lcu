@@ -203,7 +203,7 @@ test('Claude relay lists a flat js schema and forwards a completion summary unch
   try {
     const tools = (await bridge.client.listTools()).tools;
     assert.deepEqual(tools.find(tool => tool.name === 'js').inputSchema, {
-      type: 'object', additionalProperties: false, properties: {
+      type: 'object', properties: {
         code: { type: 'string' }, timeout_ms: { type: 'integer' }, title: { type: 'string' },
         completion_summary: { type: 'string' },
       },

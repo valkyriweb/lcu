@@ -58,7 +58,7 @@ test('Pi registers a flat js schema, forwards both forms unchanged, and cleans u
     assert.deepEqual([...tools.keys()], ['js', 'js_reset']);
     assert.equal(tools.get('js').description, 'Original JS description.');
     assert.deepEqual(tools.get('js').parameters, {
-      type: 'object', additionalProperties: false, properties: {
+      type: 'object', properties: {
         code: { type: 'string' }, timeout_ms: { type: 'integer' }, title: { type: 'string' },
         completion_summary: { type: 'string' },
       },
