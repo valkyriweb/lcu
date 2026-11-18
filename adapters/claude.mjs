@@ -15,6 +15,7 @@ import {
   createApprovalGate,
   createApprovalLogger,
   createCallTracker,
+  flattenToolDescriptor,
   isMainModule,
   nativeAppApprovalOptions,
   nativeAppApprovalResponse,
@@ -215,7 +216,7 @@ export async function runClaudeBridge({
     log.event('upstream_connect', { ms: Date.now() - connectStarted, ok: true });
     const listed = await upstream.listTools();
     const upstreamTools = listed.tools;
-    const publicTools = upstreamTools.filter(tool => PUBLIC_TOOLS.has(tool.name));
+    const publicTools = upstreamTools.filter(tool => PUBLIC_TOOLS.has(tool.name)).map(flattenToolDescriptor);
     if (publicTools.length !== PUBLIC_TOOLS.size ||
         !upstreamTools.some(tool => tool.name === TURN_END_TOOL)) {
       throw new Error('Original CUA js/js_reset and turn_ended tools are required');

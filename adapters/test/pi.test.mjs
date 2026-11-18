@@ -22,12 +22,12 @@ async function waitForFileMatch(path, predicate, timeoutMs = 5_000) {
   assert.fail(`Fixture did not reach the expected state within ${timeoutMs} ms`);
 }
 
-test('Pi keeps one original CUA turn across model rounds and cleans up after agent_end', async () => {
+test('Pi registers a flat js schema, forwards both forms unchanged, and cleans up after agent_end', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'lcu-pi-'));
   const log = join(directory, 'mcp.jsonl');
   const oldCommand = process.env.LCU_MCP_COMMAND;
   const oldLog = process.env.LCU_FIXTURE_LOG;
-  process.env.LCU_MCP_COMMAND = JSON.stringify([process.execPath, fixture]);
+  process.env.LCU_MCP_COMMAND = JSON.stringify([process.execPath, fixture, '--js-one-of']);
   process.env.LCU_FIXTURE_LOG = log;
   const handlers = new Map();
   const tools = new Map();
@@ -57,15 +57,22 @@ test('Pi keeps one original CUA turn across model rounds and cleans up after age
     assert.match(legacy.systemPrompt, /^Pi base prompt\n\nOriginal CUA initialization guide/);
     assert.deepEqual([...tools.keys()], ['js', 'js_reset']);
     assert.equal(tools.get('js').description, 'Original JS description.');
-    assert.deepEqual(tools.get('js').parameters.required, ['code']);
+    assert.deepEqual(tools.get('js').parameters, {
+      type: 'object', additionalProperties: false, properties: {
+        code: { type: 'string' }, timeout_ms: { type: 'integer' }, title: { type: 'string' },
+        completion_summary: { type: 'string' },
+      },
+    });
     await handlers.get('agent_start')({}, ctx);
-    const first = await tools.get('js').execute('1', { code: 'first' }, undefined, undefined, ctx);
+    const codeArgs = { code: 'first', timeout_ms: 5000, title: 'Read the fixture' };
+    const first = await tools.get('js').execute('1', codeArgs, undefined, undefined, ctx);
     assert.equal(first.content[0].text, 'first');
     // Pi emits turn_end after each assistant/model round. LCU cleanup belongs
     // to agent_end, so this event has no adapter handler.
     assert.equal(handlers.has('turn_end'), false);
-    const second = await tools.get('js').execute('2', { code: 'second' }, undefined, undefined, ctx);
-    assert.equal(second.content[0].text, 'second');
+    const summaryArgs = { completion_summary: 'Read the fixture' };
+    const second = await tools.get('js').execute('2', summaryArgs, undefined, undefined, ctx);
+    assert.equal(second.content[0].text, summaryArgs.completion_summary);
     const audio = await tools.get('js').execute('3', { code: 'audio' }, undefined, undefined, ctx);
     assert.equal('isError' in audio, false);
     assert.match(audio.content[0].text, /original MIME type: audio\/wav/);
@@ -75,6 +82,7 @@ test('Pi keeps one original CUA turn across model rounds and cleans up after age
     assert.deepEqual(readFileSync(audioPath), Buffer.from('AAAA', 'base64'));
     audioDirectory = dirname(audioPath);
     let entries = readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.deepEqual(entries.slice(0, 2).map(entry => entry.args), [codeArgs, summaryArgs]);
     assert.equal(entries.some(entry => entry.name === 'turn_ended'), false);
     assert.equal(entries[0].meta['x-codex-turn-metadata'].session_id, 'pi-real-session');
     assert.equal(entries[0].meta['x-codex-turn-metadata'].turn_id,

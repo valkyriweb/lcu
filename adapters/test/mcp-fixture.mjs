@@ -48,10 +48,18 @@ if (controlPath) {
     control.listen(controlPath, resolve);
   });
 }
+const jsSchema = process.argv.includes('--js-one-of') ? {
+  type: 'object',
+  additionalProperties: false,
+  oneOf: [
+    { type: 'object', required: ['code'], properties: {
+      code: { type: 'string' }, timeout_ms: { type: 'integer' }, title: { type: 'string' },
+    } },
+    { type: 'object', required: ['completion_summary'], properties: { completion_summary: { type: 'string' } } },
+  ],
+} : { type: 'object', properties: { code: { type: 'string' } }, required: ['code'], additionalProperties: false };
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
-  { name: 'js', description: 'Original JS description.', inputSchema: {
-    type: 'object', properties: { code: { type: 'string' } }, required: ['code'], additionalProperties: false,
-  } },
+  { name: 'js', description: 'Original JS description.', inputSchema: jsSchema },
   { name: 'js_reset', description: 'Original reset description.', inputSchema: {
     type: 'object', properties: {}, additionalProperties: false,
   } },
@@ -68,7 +76,7 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
       completePending = () => resolve({ content: [{ type: 'text', text: 'Original stopped condition.' }] });
     });
   }
-  if (name === 'js' && args?.code.includes('// lcu-pick:')) {
+  if (name === 'js' && args?.code?.includes('// lcu-pick:')) {
     const profile = id => ({ id, name: 'Chrome', type: 'extension', family: 'chrome',
       metadata: { extensionInstanceId: id } });
     const apps = [
@@ -184,6 +192,6 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
   if (name === 'js' && args?.code === 'audio') {
     return { content: [{ type: 'audio', data: 'AAAA', mimeType: 'audio/wav' }] };
   }
-  return { content: [{ type: 'text', text: name === 'js' ? String(args?.code) : name }] };
+  return { content: [{ type: 'text', text: name === 'js' ? String(args?.code ?? args?.completion_summary) : name }] };
 });
 await server.connect(new StdioServerTransport());

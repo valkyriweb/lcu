@@ -3,7 +3,7 @@ import { userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import type { TSchema } from 'typebox';
-import { createCuaClient, nativeAppApprovalOptions, nativeAppApprovalResponse } from '../client.mjs';
+import { createCuaClient, flattenToolDescriptor, nativeAppApprovalOptions, nativeAppApprovalResponse } from '../client.mjs';
 import { persistAudioContent } from '../audio-files.mjs';
 
 type OriginalContent = { type: string; text?: string; data?: string; mimeType?: string };
@@ -387,7 +387,7 @@ export default function (pi: ExtensionAPI, options: {
         name,
         label: `LCU ${name}`,
         description: descriptor.description ?? '',
-        parameters: descriptor.inputSchema as TSchema,
+        parameters: flattenToolDescriptor(descriptor).inputSchema as TSchema,
         ...(options.ompEssentialTools ? { loadMode: 'essential' } : {}),
         async execute(id, args, signal, _onUpdate, ctx) {
           const current = await connected();

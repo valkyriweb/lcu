@@ -43,7 +43,7 @@ async function waitFor(predicate, timeoutMs = 5_000) {
   assert.fail(`Condition did not become true within ${timeoutMs} ms`);
 }
 
-async function connectRelay({ throughCurrentSymlink = false } = {}) {
+async function connectRelay({ throughCurrentSymlink = false, jsOneOf = false } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'lcu-claude-relay-test-'));
   const logPath = join(directory, 'original-fixture.jsonl');
   const env = {
@@ -56,7 +56,8 @@ async function connectRelay({ throughCurrentSymlink = false } = {}) {
   const scriptPath = throughCurrentSymlink ? installedCurrentEntryPoint(directory) : relay;
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: [scriptPath, process.execPath, fixture],
+    args: [scriptPath, process.execPath, ...(jsOneOf
+      ? [fileURLToPath(new URL('./mcp-fixture.mjs', import.meta.url)), '--js-one-of'] : [fixture])],
     env,
     stderr: 'pipe',
   });
@@ -192,6 +193,25 @@ test('Claude relay preserves original tool contract and forwards the exact corre
   const bridge = await connectRelay();
   try {
     await assertOriginalProtocol(bridge);
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('Claude relay lists a flat js schema and forwards a completion summary unchanged', async () => {
+  const bridge = await connectRelay({ jsOneOf: true });
+  try {
+    const tools = (await bridge.client.listTools()).tools;
+    assert.deepEqual(tools.find(tool => tool.name === 'js').inputSchema, {
+      type: 'object', additionalProperties: false, properties: {
+        code: { type: 'string' }, timeout_ms: { type: 'integer' }, title: { type: 'string' },
+        completion_summary: { type: 'string' },
+      },
+    });
+    const args = { completion_summary: 'Read the fixture' };
+    const result = await callWithContext(bridge.client, 'js', args, { toolUseId: 'summary-use' });
+    assert.deepEqual(result.content, [{ type: 'text', text: args.completion_summary }]);
+    assert.deepEqual(bridge.logs().find(entry => entry.name === 'js').args, args);
   } finally {
     await bridge.close();
   }

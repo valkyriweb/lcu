@@ -12,6 +12,33 @@ import { openDiagnosticLog } from './diagnostics.mjs';
 import { declineAgentHostApp } from './host-guard.mjs';
 
 const MODEL_TOOLS = new Set(['js', 'js_reset']);
+const TOP_LEVEL_COMBINATORS = ['oneOf', 'anyOf'];
+
+/**
+ * Some model APIs reject top-level schema alternatives. Advertise their combined properties,
+ * requiring only what all forms require. The original server still validates unchanged calls.
+ */
+export function flattenToolDescriptor(tool) {
+  const schema = tool.inputSchema;
+  const combinators = TOP_LEVEL_COMBINATORS.filter(key => Array.isArray(schema?.[key]));
+  if (combinators.length === 0) return tool;
+  const inputSchema = { ...schema, type: 'object', properties: { ...schema.properties } };
+  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+  for (const key of combinators) {
+    delete inputSchema[key];
+    const forms = schema[key].filter(form => form && typeof form === 'object');
+    for (const form of forms) {
+      for (const [name, property] of Object.entries(form.properties ?? {})) inputSchema.properties[name] ??= property;
+    }
+    const formRequired = forms.map(form => (Array.isArray(form.required) ? form.required : []));
+    for (const name of formRequired[0] ?? []) {
+      if (formRequired.every(names => names.includes(name))) required.add(name);
+    }
+  }
+  if (required.size > 0) inputSchema.required = [...required];
+  else delete inputSchema.required;
+  return { ...tool, inputSchema };
+}
 
 /** Default cleanup/tool timeout; `js` extends past a longer requested run. */
 export const TURN_END_TIMEOUT_MS = 120_000;
