@@ -15,7 +15,6 @@ import {
   createApprovalGate,
   createApprovalLogger,
   createCallTracker,
-  flattenToolDescriptor,
   isMainModule,
   nativeAppApprovalOptions,
   nativeAppApprovalResponse,
@@ -80,6 +79,38 @@ function asError(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
+const TOP_LEVEL_COMBINATORS = ['oneOf', 'anyOf'];
+
+/**
+ * The descriptor Claude gets for an original public tool. Claude Code leaves out an MCP tool whose input
+ * schema has a top-level `oneOf` or `anyOf`, and the original `js` lists its two argument forms (`code`, or
+ * `completion_summary` alone) under a top-level `oneOf`, so the model would get `js_reset` and no `js`. Such a
+ * schema becomes one object with the properties of every form, requiring only what every form requires.
+ * Calls still reach the original server unchanged, and it checks them against its own schema. Any other
+ * descriptor is returned as it is.
+ */
+export function claudeToolDescriptor(tool) {
+  const schema = tool.inputSchema;
+  const combinators = TOP_LEVEL_COMBINATORS.filter(key => Array.isArray(schema?.[key]));
+  if (combinators.length === 0) return tool;
+  const inputSchema = { ...schema, type: 'object', properties: { ...schema.properties } };
+  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+  for (const key of combinators) {
+    delete inputSchema[key];
+    const forms = schema[key].filter(form => form && typeof form === 'object');
+    for (const form of forms) {
+      for (const [name, property] of Object.entries(form.properties ?? {})) inputSchema.properties[name] ??= property;
+    }
+    const formRequired = forms.map(form => (Array.isArray(form.required) ? form.required : []));
+    for (const name of formRequired[0] ?? []) {
+      if (formRequired.every(names => names.includes(name))) required.add(name);
+    }
+  }
+  if (required.size > 0) inputSchema.required = [...required];
+  else delete inputSchema.required;
+  return { ...tool, inputSchema };
+}
+
 function requireTurnContext(value) {
   if (!value || typeof value !== 'object' ||
       !nonEmptyString(value.session_id) || !nonEmptyString(value.turn_id) ||
@@ -118,7 +149,8 @@ function nativeForm(params, approval) {
 /**
  * Run a Claude-facing MCP server that relays the selected original LCU server.
  * The relay leaves public tool descriptors, instructions, and result blocks
- * with the original server and changes only the host-specific identity seams.
+ * with the original server and changes only the host-specific identity seams,
+ * plus the top-level shape of an input schema Claude Code leaves out (`claudeToolDescriptor`).
  */
 export async function runClaudeBridge({
   command, args = [], cwd, env, log = openDiagnosticLog({ adapter: 'claude' }),
@@ -216,7 +248,7 @@ export async function runClaudeBridge({
     log.event('upstream_connect', { ms: Date.now() - connectStarted, ok: true });
     const listed = await upstream.listTools();
     const upstreamTools = listed.tools;
-    const publicTools = upstreamTools.filter(tool => PUBLIC_TOOLS.has(tool.name)).map(flattenToolDescriptor);
+    const publicTools = upstreamTools.filter(tool => PUBLIC_TOOLS.has(tool.name)).map(claudeToolDescriptor);
     if (publicTools.length !== PUBLIC_TOOLS.size ||
         !upstreamTools.some(tool => tool.name === TURN_END_TOOL)) {
       throw new Error('Original CUA js/js_reset and turn_ended tools are required');
