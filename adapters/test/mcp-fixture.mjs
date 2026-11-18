@@ -3,7 +3,8 @@ import { createServer } from 'node:net';
 import { runInNewContext } from 'node:vm';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { CallToolRequestSchema, ErrorCode, ListToolsRequestSchema, McpError } from '@modelcontextprotocol/sdk/types.js';
+import { AjvJsonSchemaValidator } from '@modelcontextprotocol/sdk/validation/ajv';
 
 const server = new Server({ name: 'original-cua-contract-fixture', version: '1' },
   { capabilities: { tools: {} }, instructions: 'Original CUA initialization guide.' });
@@ -48,10 +49,20 @@ if (controlPath) {
     control.listen(controlPath, resolve);
   });
 }
+const jsOneOf = process.argv.includes('--js-one-of');
+const jsSchema = jsOneOf ? {
+  type: 'object',
+  oneOf: [
+    { type: 'object', required: ['code'], additionalProperties: false, properties: {
+      code: { type: 'string' }, timeout_ms: { type: 'integer' }, title: { type: 'string' },
+    } },
+    { type: 'object', required: ['completion_summary'], additionalProperties: false,
+      properties: { completion_summary: { type: 'string' } } },
+  ],
+} : { type: 'object', properties: { code: { type: 'string' } }, required: ['code'], additionalProperties: false };
+const validateJs = jsOneOf ? new AjvJsonSchemaValidator().getValidator(jsSchema) : undefined;
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
-  { name: 'js', description: 'Original JS description.', inputSchema: {
-    type: 'object', properties: { code: { type: 'string' } }, required: ['code'], additionalProperties: false,
-  } },
+  { name: 'js', description: 'Original JS description.', inputSchema: jsSchema },
   { name: 'js_reset', description: 'Original reset description.', inputSchema: {
     type: 'object', properties: {}, additionalProperties: false,
   } },
@@ -60,6 +71,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [
 ] }));
 server.setRequestHandler(CallToolRequestSchema, async request => {
   const { name, arguments: args, _meta } = request.params;
+  if (name === 'js' && validateJs) {
+    const validation = validateJs(args);
+    if (!validation.valid) throw new McpError(ErrorCode.InvalidParams, validation.errorMessage);
+  }
   record({ name, args, meta: _meta });
   if (name === 'js' && args?.code === 'stop-pending') {
     const turn = _meta?.['x-codex-turn-metadata'] ?? {};
@@ -68,7 +83,7 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
       completePending = () => resolve({ content: [{ type: 'text', text: 'Original stopped condition.' }] });
     });
   }
-  if (name === 'js' && args?.code.includes('// lcu-pick:')) {
+  if (name === 'js' && args?.code?.includes('// lcu-pick:')) {
     const profile = id => ({ id, name: 'Chrome', type: 'extension', family: 'chrome',
       metadata: { extensionInstanceId: id } });
     const apps = [
@@ -184,6 +199,6 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
   if (name === 'js' && args?.code === 'audio') {
     return { content: [{ type: 'audio', data: 'AAAA', mimeType: 'audio/wav' }] };
   }
-  return { content: [{ type: 'text', text: name === 'js' ? String(args?.code) : name }] };
+  return { content: [{ type: 'text', text: name === 'js' ? String(args?.code ?? args?.completion_summary) : name }] };
 });
 await server.connect(new StdioServerTransport());
